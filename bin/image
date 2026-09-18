@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Human front door for the show-image rail."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from PIL import Image, ImageChops, ImageOps
+
+
+EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+MAX_MANIFEST_BYTES = 1024 * 1024
+
+
+class ImageCliError(ValueError):
+    pass
+
+
+def _real_script_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _skill_script() -> Path:
+    override = os.environ.get("IMAGE_IMG_SH")
+    if override:
+        return Path(override)
+    return _real_script_dir().parent / "skills" / "show-image" / "scripts" / "img.sh"
+
+
+def _install_zsh_completion() -> None:
+    """Register the shipped completion in the user's existing Oh My Zsh path."""
+    source = _real_script_dir().parent / "completions" / "_image"
+    oh_my_zsh = Path.home() / ".oh-my-zsh"
+    if not source.is_file() or not oh_my_zsh.is_dir():
+        return
+    completion_dir = oh_my_zsh / "completions"
+    target = completion_dir / "_image"
+    try:
+        completion_dir.mkdir(mode=0o700, exist_ok=True)
+        if target.is_symlink() and target.resolve() == source.resolve():
+            return
+        if target.exists() or target.is_symlink():
+            return
+        target.symlink_to(source)
+    except OSError:
+        # Completion installation must never make the image command unusable.
+        return
+
+
+def _run_skill(*args: str) -> int:
+    script = _skill_script()
+    if not script.is_file():
+        raise ImageCliError(f"show-image backend is missing: {script}")
+    return subprocess.run([str(script), *args], check=False).returncode
+
+
+def _dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        with Image.open(path) as image:
+            return ImageOps.exif_transpose(image).size
+    except (OSError, ValueError):
+        return None
+
+
+def _search_dirs() -> list[Path]:
+    home = Path.home()
+    candidates = [home / ".cache" / "agent-images", home / "Downloads", home / "Desktop", Path.cwd()]
+    seen: set[str] = set()
+    result = []
+    for candidate in candidates:
+        key = os.path.abspath(candidate)
+        if key not in seen:
+            seen.add(key)
+            result.append(candidate)
+    return result
+
+
+def recent_images() -> list[tuple[float, Path, tuple[int, int]]]:
+    found: dict[str, tuple[float, Path, tuple[int, int]]] = {}
+    for directory in _search_dirs():
+        if not directory.is_dir():
+            continue
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if path.is_symlink() or not path.is_file() or path.name.startswith(".") or path.suffix.lower() not in EXTENSIONS:
+                continue
+            dims = _dimensions(path)
+            if dims is None:
+                continue
+            try:
+                stamp = path.stat().st_mtime
+            except OSError:
+                continue
+            key = os.path.realpath(path)
+            current = found.get(key)
+            if current is None or stamp > current[0]:
+                found[key] = (stamp, path.absolute(), dims)
+    return sorted(found.values(), key=lambda item: (item[0], str(item[1])), reverse=True)
+
+
+def _age(stamp: float) -> str:
+    seconds = max(0, int(dt.datetime.now().timestamp() - stamp))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def cmd_ls(paths_only: bool = False) -> int:
+    for stamp, path, dims in recent_images():
+        if paths_only:
+            print(path)
+        else:
+            print(f"{dims[0]}x{dims[1]}\t{_age(stamp):>4}\t{path}")
+    return 0
+
+
+def _show(path: str, caption: str, zoom: str) -> int:
+    args = ["show", path]
+    if caption:
+        args.append(caption)
+    args.extend(["--zoom", zoom])
+    return _run_skill(*args)
+
+
+def cmd_show(args: list[str]) -> int:
+    zoom = "fit"
+    explicit_zoom: str | None = None
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "-s":
+            zoom = "100"
+        elif arg == "-m":
+            zoom = "fit"
+        elif arg == "-l":
+            zoom = "200"
+        elif arg == "--zoom":
+            index += 1
+            if index >= len(args):
+                raise ImageCliError("--zoom needs a positive integer")
+            explicit_zoom = args[index]
+        elif arg.startswith("--zoom="):
+            explicit_zoom = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            raise ImageCliError(f"unknown option: {arg}")
+        else:
+            positionals.append(arg)
+        index += 1
+    if not positionals:
+        raise ImageCliError("usage: image [-s|-m|-l|--zoom N] <path> [caption]")
+    if explicit_zoom is not None:
+        if not explicit_zoom.isdigit() or int(explicit_zoom) < 1:
+            raise ImageCliError("--zoom needs a positive integer")
+        zoom = explicit_zoom
+    return _show(positionals[0], " ".join(positionals[1:]), zoom)
+
+
+def cmd_last(args: list[str]) -> int:
+    if args:
+        raise ImageCliError("usage: image last")
+    images = recent_images()
+    if not images:
+        raise ImageCliError("no images found in the rail cache, Downloads, Desktop, or current directory")
+    return _show(str(images[0][1]), "", "fit")
+
+
+def _cell(path: Path, label: str | None = None) -> dict[str, str]:
+    absolute = path.expanduser().absolute()
+    if _dimensions(absolute) is None:
+        raise ImageCliError(f"not a readable image: {path}")
+    return {"path": str(absolute), "label": label if label is not None else path.name}
+
+
+def _load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > MAX_MANIFEST_BYTES:
+            raise ImageCliError(f"manifest is too large (max {MAX_MANIFEST_BYTES} bytes)")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ImageCliError(f"cannot read manifest {path}: {exc}") from exc
+    if not isinstance(raw, list) or not raw:
+        raise ImageCliError("manifest must be a non-empty JSON array")
+    rows = []
+    for row in raw:
+        if not isinstance(row, dict) or not isinstance(row.get("cells"), list) or not row["cells"]:
+            raise ImageCliError("every manifest row needs a non-empty cells array")
+        cells = []
+        for value in row["cells"]:
+            if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+                raise ImageCliError("every manifest cell needs a string path")
+            cell_path = Path(value["path"]).expanduser()
+            if not cell_path.is_absolute():
+                cell_path = path.parent / cell_path
+            cells.append(_cell(cell_path, str(value.get("label", cell_path.name))))
+        rows.append(
+            {
+                "row_id": str(row.get("row_id", "")),
+                "cells": cells,
+                "note": str(row.get("note", "")),
+                "badge": str(row.get("badge", "")),
+            }
+        )
+    return {"layout": "cards", "rows": rows}
+
+
+def _pattern_job(pattern: str, labels_arg: str | None) -> dict[str, Any]:
+    match = re.search(r"\{([^{}]+)\}", pattern)
+    if match is None or re.search(r"[{}]", pattern[: match.start()] + pattern[match.end() :]):
+        raise ImageCliError("--pattern needs exactly one {a,b,...} group")
+    variants = [part.strip() for part in match.group(1).split(",")]
+    if not variants or any(not value for value in variants):
+        raise ImageCliError("--pattern contains an empty brace value")
+    labels = [value.strip() for value in labels_arg.split(",")] if labels_arg else variants
+    if len(labels) != len(variants):
+        raise ImageCliError("--labels count must match the pattern brace count")
+    before, after = pattern[: match.start()], pattern[match.end() :]
+    grouped: dict[str, dict[str, Path]] = {}
+    for variant in variants:
+        expanded = os.path.expanduser(before + variant + after)
+        for name in glob.glob(expanded, recursive=True):
+            absolute = os.path.abspath(name)
+            suffix = variant + after
+            if not absolute.endswith(suffix):
+                continue
+            key = absolute[: -len(suffix)] if suffix else absolute
+            grouped.setdefault(key, {})[variant] = Path(absolute)
+    rows = []
+    for key in sorted(grouped):
+        files = grouped[key]
+        if any(variant not in files for variant in variants):
+            continue
+        row_name = os.path.relpath(key.rstrip(os.sep) or key, Path.cwd())
+        rows.append(
+            {
+                "row_id": row_name,
+                "cells": [_cell(files[variant], labels[index]) for index, variant in enumerate(variants)],
+                "note": "",
+                "badge": "",
+            }
+        )
+    if not rows:
+        raise ImageCliError(f"pattern matched no complete rows: {pattern}")
+    return {"layout": "cards", "rows": rows}
+
+
+def cmd_grid(args: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="image grid", add_help=True)
+    parser.add_argument("paths", nargs="*")
+    parser.add_argument("--cols", type=int)
+    parser.add_argument("--manifest")
+    parser.add_argument("--pattern")
+    parser.add_argument("--labels")
+    parser.add_argument("--dense", action="store_true")
+    ns = parser.parse_args(args)
+    modes = int(bool(ns.paths)) + int(bool(ns.manifest)) + int(bool(ns.pattern))
+    if modes != 1:
+        raise ImageCliError("image grid needs paths, --manifest, or --pattern")
+    if ns.cols is not None and ns.cols < 1:
+        raise ImageCliError("--cols must be positive")
+    if ns.manifest:
+        if ns.cols is not None or ns.labels:
+            raise ImageCliError("--cols and --labels do not apply to --manifest")
+        job = _load_manifest(Path(ns.manifest).expanduser().absolute())
+    elif ns.pattern:
+        if ns.cols is not None:
+            raise ImageCliError("--cols does not apply to --pattern rows")
+        job = _pattern_job(ns.pattern, ns.labels)
+    else:
+        labels = [value.strip() for value in ns.labels.split(",")] if ns.labels else []
+        if labels and len(labels) != len(ns.paths):
+            raise ImageCliError("--labels count must match the image count")
+        job = {
+            "layout": "grid",
+            "cells": [_cell(Path(value), labels[index] if labels else None) for index, value in enumerate(ns.paths)],
+            "cols": ns.cols,
+        }
+    job["dense"] = ns.dense
+    with tempfile.NamedTemporaryFile("w", suffix=".grid.json", encoding="utf-8", delete=False) as handle:
+        json.dump(job, handle, ensure_ascii=False)
+        temp_name = handle.name
+    try:
+        return _run_skill("grid", temp_name, "image grid")
+    finally:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+
+
+def _permission_denied(output: str) -> bool:
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        permissions = data.get("permissions") if isinstance(data, dict) else None
+        if isinstance(permissions, list):
+            for permission in permissions:
+                if not isinstance(permission, dict):
+                    continue
+                name = str(permission.get("name", "")).lower()
+                if "screen recording" in name and permission.get("isGranted") is False:
+                    return True
+    lowered = output.lower()
+    return bool(
+        re.search(r"screen[ _-]*(recording|capture)[^\n]*(denied|false|not granted|missing)", lowered)
+        or re.search(r"(denied|false|not granted|missing)[^\n]*screen[ _-]*(recording|capture)", lowered)
+    )
+
+
+def _valid_capture(path: Path) -> bool:
+    dims = _dimensions(path)
+    return dims is not None and dims[0] >= 100 and dims[1] >= 100
+
+
+def _same_pixels(first: Path, second: Path) -> bool:
+    try:
+        with Image.open(first) as first_image, Image.open(second) as second_image:
+            left = ImageOps.exif_transpose(first_image).convert("RGB")
+            right = ImageOps.exif_transpose(second_image).convert("RGB")
+            return left.size == right.size and ImageChops.difference(left, right).getbbox() is None
+    except (OSError, ValueError):
+        return False
+
+
+def _verify_agent_capture(peekaboo: str, screen: Path) -> bool:
+    fd, name = tempfile.mkstemp(prefix="image-window-check-", suffix=".png")
+    os.close(fd)
+    window = Path(name)
+    try:
+        result = subprocess.run(
+            [peekaboo, "image", "--no-remote", "--mode", "window", "--app", "frontmost", "--path", str(window), "--json"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return result.returncode == 0 and _valid_capture(window) and not _same_pixels(screen, window)
+    finally:
+        try:
+            window.unlink()
+        except OSError:
+            pass
+
+
+def _agent_shot(output: Path) -> bool:
+    configured = os.environ.get("IMAGE_AGENT_SHOT")
+    helper = Path(configured).expanduser() if configured else Path.home() / ".local" / "bin" / "agent-shot"
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        return False
+    # The helper takes the output path as its first positional argument.
+    # It launches Peekaboo through WezTerm so macOS applies WezTerm's Screen
+    # Recording grant rather than the unprivileged agent shell's grant.
+    # The helper checks the Screen Recording grant inside that WezTerm process
+    # before capturing and exits 3 without it, so a success is never wallpaper.
+    # A second check from this shell would fail for the very reason the helper
+    # exists: this shell has no grant.
+    result = subprocess.run([str(helper), str(output), "--mode", "screen"], text=True, capture_output=True, check=False)
+    if result.returncode == 3:
+        raise ImageCliError(
+            "Screen Recording is not granted to WezTerm; capture was refused so desktop wallpaper is not displayed"
+        )
+    return result.returncode == 0 and _valid_capture(output)
+
+
+def cmd_shot(args: list[str]) -> int:
+    caption = " ".join(args)
+    peekaboo = shutil.which("peekaboo")
+    helper_exists = bool(os.environ.get("IMAGE_AGENT_SHOT")) or (Path.home() / ".local" / "bin" / "agent-shot").is_file()
+    if peekaboo is None and not helper_exists:
+        raise ImageCliError("no screen capture tool found; install peekaboo")
+    fd, name = tempfile.mkstemp(prefix="image-shot-", suffix=".png")
+    os.close(fd)
+    output = Path(name)
+    try:
+        captured = False
+        permission_problem = False
+        provenance_problem = False
+        if peekaboo is not None:
+            status = subprocess.run([peekaboo, "permissions", "status", "--json", "--no-remote"], text=True, capture_output=True, check=False)
+            permission_problem = status.returncode != 0 or _permission_denied(status.stdout + "\n" + status.stderr)
+            if not permission_problem:
+                result = subprocess.run(
+                    [peekaboo, "image", "--no-remote", "--mode", "screen", "--retina", "--path", str(output), "--json"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                captured = result.returncode == 0 and _valid_capture(output)
+                if not captured and _permission_denied(result.stdout + "\n" + result.stderr):
+                    permission_problem = True
+                if captured and not _verify_agent_capture(peekaboo, output):
+                    captured = False
+                    provenance_problem = True
+        if not captured:
+            captured = _agent_shot(output)
+        if not captured:
+            if provenance_problem:
+                raise ImageCliError(
+                    "capture provenance check failed; capture was refused so desktop wallpaper is not displayed"
+                )
+            if permission_problem or peekaboo is not None:
+                raise ImageCliError(
+                    "Screen Recording permission is unavailable to this shell; capture was refused so desktop wallpaper is not displayed"
+                )
+            raise ImageCliError("screen capture helper failed")
+        return _show(str(output), caption or "Screen capture", "fit")
+    finally:
+        try:
+            output.unlink()
+        except OSError:
+            pass
+
+
+def usage() -> None:
+    print(
+        "usage: image [-s|-m|-l|--zoom N] <path> [caption]\n"
+        "       image ls\n"
+        "       image last\n"
+        "       image shot [caption]\n"
+        "       image grid <paths...> [--cols N] [--dense]\n"
+        "       image grid --manifest FILE [--dense]\n"
+        "       image grid --pattern GLOB --labels CSV [--dense]",
+        file=sys.stderr,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    _install_zsh_completion()
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args or args[0] in {"-h", "--help", "help"}:
+        usage()
+        return 0 if args else 1
+    try:
+        if args[0] == "ls":
+            if args[1:] not in ([], ["--paths-only"]):
+                raise ImageCliError("usage: image ls")
+            return cmd_ls(args[1:] == ["--paths-only"])
+        if args[0] == "last":
+            return cmd_last(args[1:])
+        if args[0] == "shot":
+            return cmd_shot(args[1:])
+        if args[0] == "grid":
+            return cmd_grid(args[1:])
+        return cmd_show(args)
+    except ImageCliError as exc:
+        print(f"image: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# imgrail-watch — the rail. Runs inside the Herdr side pane img.sh opened and
+# redraws the newest image in the cache directory.
+#
+# It runs here, not in img.sh, for one reason: this process owns a tty. The
+# Kitty graphics handshake and the terminal size are only knowable from inside
+# the pane, and an agent's shell has neither.
+#
+# Keys: n/p page through history, r redraws, q quits.
+set -uo pipefail
+
+E_USAGE=1; E_NORENDER=4; E_NOGRAPHICS=5
+
+sanitize_text() { LC_ALL=C tr -d '\000-\037\177-\237'; }
+die() {
+  local code="$1" message
+  shift
+  message=$(printf '%s' "$*" | sanitize_text)
+  printf 'imgrail: %s\n' "$message" >&2
+  exit "$code"
+}
+
+DIR=""; ZOOM="${IMG_ZOOM:-fit}"; POLL="${IMG_POLL:-1}"; RENDERER=""; OWNER_TOKEN=""
+GRID_TIMEOUT="${IMG_GRID_TIMEOUT:-3}"
+TERMINAL_BACKGROUND="#111318"
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+COMPOSER="$SCRIPT_DIR/image-grid.py"
+
+parse_args() {
+  while (( $# )); do
+    case "$1" in
+      --dir) shift; DIR="${1:-}" ;;
+      --zoom) shift; ZOOM="${1:-}" ;;
+      --owner-token) shift; OWNER_TOKEN="${1:-}" ;;
+      *) die "$E_USAGE" "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$DIR" ]] || die "$E_USAGE" "--dir is required"
+  [[ "$OWNER_TOKEN" =~ ^imgrail-[0-9]+-[0-9]+-[0-9]+$ ]] \
+    || die "$E_USAGE" "--owner-token is required"
+  [[ "$ZOOM" == fit || ( "$ZOOM" =~ ^[0-9]+$ && "$ZOOM" -gt 0 ) ]] \
+    || die "$E_USAGE" "--zoom must be fit or a positive integer percent"
+  [[ "$POLL" =~ ^[0-9]+$ && "$POLL" -gt 0 ]] || die "$E_USAGE" "IMG_POLL must be a positive integer"
+  [[ "$GRID_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "$E_USAGE" "IMG_GRID_TIMEOUT must be a positive integer"
+  # chafa first, and that order is load-bearing: `kitten icat` asks the terminal
+  # for its size in pixels, which a Herdr pane does not report, and refuses with
+  # "Terminal does not support reporting screen sizes in pixels". chafa is told
+  # the size in cells and never asks. kitten is still used when chafa is absent,
+  # with the window size handed to it explicitly.
+  if type -P chafa >/dev/null 2>&1; then RENDERER=chafa
+  elif type -P kitten >/dev/null 2>&1; then RENDERER=kitten
+  else die "$E_NORENDER" "no renderer: install chafa or kitty (kitten)"; fi
+}
+
+# Ask the terminal whether it speaks Kitty graphics, and take silence for a no.
+# The DA1 request rides along as the terminator: every terminal answers it, so
+# an unsupported one still ends the read instead of burning the timeout.
+parse_terminal_background() {
+  local response="$1" red green blue color
+  if [[ "$response" =~ $'\033]11;rgb:'([[:xdigit:]]{2,4})/([[:xdigit:]]{2,4})/([[:xdigit:]]{2,4}) ]]; then
+    red="${BASH_REMATCH[1]:0:2}"; green="${BASH_REMATCH[2]:0:2}"; blue="${BASH_REMATCH[3]:0:2}"
+    printf '#%s%s%s' "$red" "$green" "$blue" | tr '[:upper:]' '[:lower:]'
+    return 0
+  fi
+  if [[ "$response" =~ $'\033]11;'(#[[:xdigit:]]{6}) ]]; then
+    color="${BASH_REMATCH[1]}"
+    printf '%s' "$color" | tr '[:upper:]' '[:lower:]'
+    return 0
+  fi
+  return 1
+}
+
+graphics_supported() {
+  [[ "${IMG_SKIP_QUERY:-}" == 1 ]] && return 0
+  [[ -t 0 && -t 1 ]] || return 0   # no tty: nothing to ask, do not refuse
+  local saved resp="" background=""
+  saved=$(stty -g 2>/dev/null) || return 0
+  stty raw -echo min 0 time 20 2>/dev/null || return 0
+  printf '\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\033\\\033]11;?\a\033[c' >/dev/tty
+  IFS= read -r -s -t 2 -d c resp </dev/tty || true
+  stty "$saved" 2>/dev/null || true
+  background=$(parse_terminal_background "$resp" || true)
+  [[ -z "$background" ]] || TERMINAL_BACKGROUND="$background"
+  [[ "$resp" == *"_Gi=31;OK"* ]]
+}
+
+# Cell pixels come from Herdr when it knows them. 8x16 is the same fallback
+# Herdr itself uses, and being wrong here only changes the drawn size.
+cell_w="${HERDR_CELL_WIDTH_PX:-8}"; cell_h="${HERDR_CELL_HEIGHT_PX:-16}"
+[[ "$cell_w" =~ ^[0-9]+$ && "$cell_w" -gt 0 ]] || cell_w=8
+[[ "$cell_h" =~ ^[0-9]+$ && "$cell_h" -gt 0 ]] || cell_h=16
+
+# Pixel dimensions, asked of a tool that knows them. `file` is the last resort.
+# Its JPEG description puts JFIF density before the encoded dimensions, so the
+# final WxH pair is the image size. Choosing the largest pair mistakes 300-DPI
+# metadata for the dimensions of a small image.
+image_px() {
+  local dims w h
+  if type -P sips >/dev/null 2>&1; then
+    dims=$(sips -g pixelWidth -g pixelHeight -- "$1" 2>/dev/null)
+    w=$(printf '%s\n' "$dims" | awk '/pixelWidth/ {print $2}')
+    h=$(printf '%s\n' "$dims" | awk '/pixelHeight/ {print $2}')
+    if [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ ]]; then printf '%sx%s' "$w" "$h"; return 0; fi
+  fi
+  if type -P identify >/dev/null 2>&1; then
+    dims=$(identify -format '%wx%h' -- "$1" 2>/dev/null | head -n1)
+    [[ "$dims" =~ ^[0-9]+x[0-9]+$ ]] && { printf '%s' "$dims"; return 0; }
+  fi
+  dims=$(file -b -- "$1" 2>/dev/null | grep -Eo '[0-9]+ ?x ?[0-9]+' | tr -d ' ' | tail -n1)
+  [[ -n "$dims" ]] || return 1
+  printf '%s' "$dims"
+}
+
+# Natural size in cells, scaled by the zoom percent, then clamped to the pane
+# with the aspect ratio kept — clamping width and height independently is how a
+# tall image ends up stretched.
+target_cells() {
+  local px_w="$1" px_h="$2" cols="$3" rows="$4"
+  local nat_c nat_r want_c want_r
+  nat_c=$(( (px_w + cell_w - 1) / cell_w )); (( nat_c > 0 )) || nat_c=1
+  nat_r=$(( (px_h + cell_h - 1) / cell_h )); (( nat_r > 0 )) || nat_r=1
+  local max_c=$(( cols - 1 )) max_r=$(( rows - 3 ))
+  (( max_c > 0 )) || max_c=1
+  (( max_r > 0 )) || max_r=1
+  if [[ "$ZOOM" == fit ]]; then
+    want_c=$max_c
+    want_r=$(( nat_r * max_c / nat_c )); (( want_r > 0 )) || want_r=1
+    if (( want_r > max_r )); then
+      want_c=$(( nat_c * max_r / nat_r )); (( want_c > 0 )) || want_c=1
+      want_r=$max_r
+    fi
+  else
+    want_c=$(( nat_c * ZOOM / 100 )); (( want_c > 0 )) || want_c=1
+    want_r=$(( nat_r * ZOOM / 100 )); (( want_r > 0 )) || want_r=1
+  fi
+  if (( want_c > max_c || want_r > max_r )); then
+    # Fit against the limiting edge directly. A fixed-point scale factor can
+    # truncate to zero for ratios above 1000:1 and collapse a wide image to 1x1.
+    if (( want_c * max_r >= want_r * max_c )); then
+      want_r=$(( want_r * max_c / want_c )); (( want_r > 0 )) || want_r=1
+      want_c=$max_c
+    else
+      want_c=$(( want_c * max_r / want_r )); (( want_c > 0 )) || want_c=1
+      want_r=$max_r
+    fi
+  fi
+  printf '%s %s' "$want_c" "$want_r"
+}
+
+images() {
+  local f name
+  for f in "$DIR"/*; do
+    if [[ -d "$f" && ! -L "$f" && -f "$f/job.grid.json" && ! -L "$f/job.grid.json" ]]; then
+      printf '%s\n' "$f/job.grid.json"
+      continue
+    fi
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    name="${f##*/}"
+    case "$name" in *.caption|*.zoom|*.pane|.*) continue ;; esac
+    printf '%s\n' "$f"
+  done | sort
+}
+
+caption_of() {
+  [[ -f "$1.caption" ]] && head -n1 -- "$1.caption" 2>/dev/null || basename -- "$1"
+}
+
+zoom_of() {
+  local value="$ZOOM"
+  [[ -f "$1.zoom" ]] && { IFS= read -r value < "$1.zoom"; } 2>/dev/null
+  if [[ "$value" == fit || ( "$value" =~ ^[0-9]+$ && "$value" -gt 0 ) ]]; then
+    printf '%s' "$value"
+  else
+    printf 'fit'
+  fi
+}
+
+GRID_PAGE=0
+GRID_TOTAL=1
+GRID_FILE=""
+composer_with_deadline() {
+  python3 - "$GRID_TIMEOUT" "$@" <<'PY'
+import subprocess, sys
+
+timeout = int(sys.argv[1])
+command = sys.argv[2:]
+process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    stdout, stderr = process.communicate(timeout=timeout)
+except subprocess.TimeoutExpired:
+    process.kill()
+    stdout, stderr = process.communicate()
+    sys.stderr.buffer.write(stderr)
+    sys.stderr.write("image-grid: composer deadline exceeded\n")
+    raise SystemExit(124)
+sys.stdout.buffer.write(stdout)
+sys.stderr.buffer.write(stderr)
+raise SystemExit(process.returncode)
+PY
+}
+
+compose_grid_page() {
+  local job="$1" px_w="$2" px_h="$3" stem out answer actual total log
+  [[ -x "$COMPOSER" ]] || { printf 'imgrail: grid composer is missing: %s\n' "$COMPOSER" >&2; return 1; }
+  type -P python3 >/dev/null 2>&1 || { printf 'imgrail: python3 is required for grids\n' >&2; return 1; }
+  stem=$(basename -- "$job"); stem="${stem//[^A-Za-z0-9._-]/_}"
+  out="$DIR/.grid-${stem}-${px_w}x${px_h}-${GRID_PAGE}.png"
+  log="$DIR/.render.log"
+  answer=$(composer_with_deadline python3 "$COMPOSER" "$job" --width "$px_w" --height "$px_h" \
+    --page "$GRID_PAGE" --background "$TERMINAL_BACKGROUND" --output "$out" 2>>"$log") || return 1
+  actual="${answer%% *}"; total="${answer##* }"
+  [[ "$actual" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]] || return 1
+  GRID_PAGE=$((actual - 1)); GRID_TOTAL="$total"
+  GRID_FILE="$out"
+}
+
+draw() {
+  local file="$1" idx="$2" total="$3" cols rows dims px_w px_h size c r display_file zoom_label
+  printf '\033[2J\033[H'
+  if [[ -z "$file" ]]; then
+    printf 'imgrail — no images yet in %s\n' "$(printf '%s' "$DIR" | sanitize_text)"
+    return 0
+  fi
+  cols=$(tput cols 2>/dev/null || printf 80); rows=$(tput lines 2>/dev/null || printf 24)
+  display_file="$file"; GRID_TOTAL=1
+  if [[ "$file" == *.grid.json ]]; then
+    compose_grid_page "$file" "$(( (cols - 1) * cell_w ))" "$(( (rows - 3) * cell_h ))" \
+      || { printf '\033[31mgrid compose failed\033[0m — %s\n' "$(tail -n1 "$DIR/.render.log" 2>/dev/null | sanitize_text)"; return 0; }
+    display_file="$GRID_FILE"
+    ZOOM=fit
+    zoom_label="page $((GRID_PAGE + 1))/$GRID_TOTAL"
+  else
+    ZOOM=$(zoom_of "$file")
+    zoom_label="$ZOOM"; [[ "$ZOOM" == fit ]] || zoom_label="${ZOOM}%"
+  fi
+  printf '\033[1m[%s/%s]\033[0m %s \033[2m(%s, n/p/q)\033[0m\n' \
+    "$idx" "$total" "$(caption_of "$file" | sanitize_text)" "$zoom_label"
+  dims=$(image_px "$display_file" || printf '')
+  if [[ -n "$dims" ]]; then
+    px_w="${dims%%x*}"; px_h="${dims##*x}"
+    size=$(target_cells "$px_w" "$px_h" "$cols" "$rows")
+    c="${size%% *}"; r="${size##* }"
+  else
+    c=$(( cols - 1 )); r=$(( rows - 3 ))
+  fi
+  # Renderer stderr goes to a log rather than /dev/null: "render failed" with no
+  # reason is the one failure mode nobody can debug from inside a pane.
+  local log="$DIR/.render.log"
+  if [[ "$RENDERER" == chafa ]]; then
+    chafa -f kitty --size "${c}x${r}" -- "$display_file" 2>>"$log" \
+      || printf '\033[31mrender failed\033[0m — %s\n' "$(tail -n1 "$log" 2>/dev/null | sanitize_text)"
+  else
+    kitten icat --transfer-mode=stream --align=left --scale-up \
+      --use-window-size "$cols,$rows,$(( cols * cell_w )),$(( rows * cell_h ))" \
+      --place "${c}x${r}@0x2" "$display_file" 2>>"$log" \
+      || printf '\033[31mrender failed\033[0m — %s\n' "$(tail -n1 "$log" 2>/dev/null | sanitize_text)"
+  fi
+}
+
+handle_key() {
+  local key="$1" current_file="${2:-}"
+  case "$key" in
+    q) return 10 ;;
+    n)
+      if [[ "$current_file" == *.grid.json && $((GRID_PAGE + 1)) -lt $GRID_TOTAL ]]; then
+        GRID_PAGE=$((GRID_PAGE + 1))
+      elif (( cursor > 0 )); then
+        cursor=$((cursor - 1)); active_file=""
+      fi
+      last_seen=""
+      ;;
+    p)
+      if [[ "$current_file" == *.grid.json && $GRID_PAGE -gt 0 ]]; then
+        GRID_PAGE=$((GRID_PAGE - 1))
+      else
+        cursor=$((cursor + 1)); active_file=""
+      fi
+      last_seen=""
+      ;;
+    r) last_seen="" ;;
+  esac
+}
+
+# Sourced with IMG_WATCH_LIB=1, this file is just its functions: the sizing
+# arithmetic is the part worth testing, and starting the loop to reach it is not
+# a test, it is a hang.
+[[ "${IMG_WATCH_LIB:-}" == 1 ]] && return 0
+
+# Anything else that writes to stderr, Bash's own error messages included,
+# can quote a file name. Route it through the sanitizer, keeping only newlines.
+exec 2> >(LC_ALL=C tr -d '\000-\011\013-\037\177-\237' >&2)
+
+parse_args "$@"
+
+graphics_supported || die "$E_NOGRAPHICS" \
+  "this terminal did not answer the Kitty graphics query — in Herdr set [experimental] kitty_graphics = true, then: herdr server reload-config"
+
+cleanup() { printf '\033[?25h\n'; }
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+printf '\033[?25l'
+cursor=0        # 0 = follow the newest, >0 = that many entries back
+last_seen=""
+active_file=""
+while :; do
+  # Filled by a read loop, not mapfile: this has to run on Apple's bash 3.2.
+  files=()
+  current=""
+  while IFS= read -r line; do files+=("$line"); done < <(images)
+  total=${#files[@]}
+  if (( total == 0 )); then
+    [[ "$last_seen" == "__empty__" ]] || { draw "" 0 0; last_seen="__empty__"; }
+  else
+    (( cursor >= total )) && cursor=$(( total - 1 ))
+    idx=$(( total - 1 - cursor ))
+    current="${files[$idx]}"
+    if [[ "$current" != "$active_file" ]]; then GRID_PAGE=0; active_file="$current"; fi
+    signature="$current:$GRID_PAGE"
+    if [[ "$signature" != "$last_seen" ]]; then
+      draw "$current" "$(( idx + 1 ))" "$total"
+      last_seen="$current:$GRID_PAGE"
+    fi
+  fi
+  # One bounded read is both the key handler and the poll interval: no spin,
+  # and no separate sleep that would swallow keystrokes.
+  key=""
+  IFS= read -r -s -n1 -t "$POLL" key || true
+  handle_key "$key" "$current" || [[ $? -ne 10 ]] || exit 0
+done
