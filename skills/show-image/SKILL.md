@@ -18,4 +18,4 @@ image shot "Current screen"
 
 Use absolute paths. Report command failures verbatim. A missing `HERDR_PANE_ID` means the command did not run from a Herdr pane. Exit code 4 means no renderer is installed. Exit code 5 means the terminal did not confirm Kitty graphics support.
 
-The rail accepts `n` and `p` for navigation, `r` to redraw, and `q` to close. Leave those keys to the human. The command sends input only to a pane it just created and proves ownership before it reuses or closes that pane.
+The rail accepts `n` and `p` for navigation, `+` and `-` for zoom in 25% steps, `0` to return to fit, `r` to redraw, and `q` to close. Interactive zoom stays set while the rail is open. Grid pages also accept `h`, `j`, `k`, and `l` to move focus, `Enter` to open the focused source, and `g` to return to the same grid page and focus. The rail redraws after pane resizes. Leave those keys to the human. The command sends input only to a pane it just created and proves ownership before it reuses or closes that pane.

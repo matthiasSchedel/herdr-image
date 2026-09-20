@@ -117,18 +117,56 @@ def _wrap(
     return lines
 
 
-def _nofollow_open(path: str) -> BinaryIO:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def _nofollow_fd(path: str, label: str) -> int:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or os.open not in os.supports_dir_fd:
+        raise GridError(f"cannot open {label} without following links: secure path traversal is unavailable")
+    absolute = os.path.abspath(path)
+    parts = Path(absolute).parts
+    if len(parts) < 2 or parts[0] != os.path.sep:
+        raise GridError(f"cannot open {label} without following links: invalid absolute path {path}")
+    directory_fd = -1
+    file_fd = -1
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise GridError(f"cannot open image without following links {path}: {exc}") from exc
-    try:
-        info = os.fstat(fd)
+        directory_fd = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for component in parts[1:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode):
-            raise GridError(f"image is not a regular file: {path}")
+            raise GridError(f"{label} is not a regular file: {path}")
+        return file_fd
+    except OSError as exc:
+        if file_fd >= 0:
+            os.close(file_fd)
+            file_fd = -1
+        raise GridError(f"cannot open {label} without following links {path}: {exc}") from exc
+    except BaseException:
+        if file_fd >= 0:
+            os.close(file_fd)
+            file_fd = -1
+        raise
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def _canonical_leaf_path(path: str) -> str:
+    absolute = os.path.abspath(path)
+    name = os.path.basename(absolute)
+    if not name:
+        raise GridError(f"path does not name a file: {path}")
+    return os.path.join(os.path.realpath(os.path.dirname(absolute)), name)
+
+
+def _nofollow_open(path: str) -> BinaryIO:
+    fd = _nofollow_fd(path, "image")
+    try:
         return os.fdopen(fd, "rb")
     except BaseException:
         os.close(fd)
@@ -170,7 +208,7 @@ def _validate_cell(cell: Any, base_dir: str | None = None) -> tuple[dict[str, st
     expanded = os.path.expanduser(cell["path"])
     if base_dir is not None and not os.path.isabs(expanded):
         expanded = os.path.join(base_dir, expanded)
-    path = os.path.abspath(expanded)
+    path = _canonical_leaf_path(expanded)
     width, height = _image_dimensions(path)
     return {
         "path": path,
@@ -247,13 +285,8 @@ def validate_job(raw: Any, base_dir: str | None = None) -> dict[str, Any]:
 def _read_job(path: str) -> dict[str, Any]:
     fd = -1
     try:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
+        fd = _nofollow_fd(_canonical_leaf_path(path), "grid job")
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise GridError(f"grid job is not a regular file: {path}")
         if info.st_size > MAX_JSON_BYTES:
             raise GridError(f"manifest JSON is too large (max {MAX_JSON_BYTES} bytes)")
         with os.fdopen(fd, encoding="utf-8") as handle:
@@ -331,6 +364,7 @@ def _palette(background: str) -> dict[str, str]:
         "edge": "#c4c9d2" if light else "#343b49",
         "badge": "#f3d9a7" if light else "#5b3b08",
         "badge_text": "#4d3100" if light else "#ffd88a",
+        "focus": "#006dff" if light else "#69a7ff",
     }
 
 
@@ -348,6 +382,27 @@ def _draw_label(
     draw.text((x0, y0), value, fill=color, font=font)
 
 
+def _draw_focus(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    color: str,
+) -> None:
+    x0, y0, x1, y1 = box
+    if x1 < x0 or y1 < y0:
+        return
+    width = max(1, min(4, (x1 - x0 + 1) // 2, (y1 - y0 + 1) // 2))
+    draw.rectangle(box, outline=color, width=width)
+
+
+def _render_focused_image(canvas: Image.Image, cell: dict[str, str]) -> int:
+    source = _open_image(cell["path"])
+    fitted = ImageOps.contain(source, canvas.size, Image.Resampling.LANCZOS)
+    x = (canvas.width - fitted.width) // 2
+    y = (canvas.height - fitted.height) // 2
+    canvas.paste(fitted, (x, y))
+    return fitted.width * fitted.height
+
+
 def _render_grid(
     canvas: Image.Image,
     cells: list[dict[str, str]],
@@ -355,6 +410,7 @@ def _render_grid(
     rendered: list[str],
     palette: dict[str, str],
     dense: bool,
+    focus: int,
 ) -> int:
     draw = ImageDraw.Draw(canvas)
     width, height = canvas.size
@@ -389,6 +445,13 @@ def _render_grid(
                 rendered,
                 palette["text"],
             )
+        if index == focus:
+            inset = 1 if cell_w > 2 and cell_h > 2 else 0
+            _draw_focus(
+                draw,
+                (x + inset, y + inset, x + cell_w - inset - 1, y + cell_h - inset - 1),
+                palette["focus"],
+            )
     return image_area
 
 
@@ -398,12 +461,13 @@ def _render_cards(
     rendered: list[str],
     palette: dict[str, str],
     dense: bool,
+    focus: int,
 ) -> tuple[int, list[list[str]]]:
     width, height = canvas.size
     if dense:
         cells = [cell for row in rows for cell in row["cells"]]
         cols = _default_cols(len(cells), width, height)
-        return _render_grid(canvas, cells, cols, rendered, palette, True), []
+        return _render_grid(canvas, cells, cols, rendered, palette, True, focus), []
     draw = ImageDraw.Draw(canvas)
     margin, gap = 8, 8
     row_id_font = _font(max(14, min(19, width // 62)), mono=True)
@@ -416,6 +480,7 @@ def _render_cards(
     image_area = 0
     rendered_notes: list[list[str]] = []
     y = margin
+    cell_index = 0
     for row, base_height in zip(rows, heights):
         card_h = base_height + bonus
         x0, x1, y1 = margin, width - margin, min(height - margin, y + card_h)
@@ -454,6 +519,19 @@ def _render_cards(
                 rendered,
                 palette["text"],
             )
+            if cell_index == focus:
+                inset = 1 if cell_w > 2 and image_bottom - image_top > 2 else 0
+                _draw_focus(
+                    draw,
+                    (
+                        cx + inset,
+                        image_top + inset,
+                        cx + cell_w - inset - 1,
+                        image_bottom - inset - 1,
+                    ),
+                    palette["focus"],
+                )
+            cell_index += 1
         if note:
             rendered.append(note)
             ny = y1 - 8 - note_h
@@ -462,6 +540,22 @@ def _render_cards(
                 ny += note_line_h
         y = y1 + gap
     return image_area, rendered_notes
+
+
+def _focus_navigation(row_lengths: list[int], focus: int) -> dict[str, int]:
+    offsets: list[int] = []
+    total = 0
+    for length in row_lengths:
+        offsets.append(total)
+        total += length
+    focus = max(0, min(focus, total - 1))
+    row = max(index for index, offset in enumerate(offsets) if offset <= focus)
+    col = focus - offsets[row]
+    left = focus - 1 if col > 0 else focus
+    right = focus + 1 if col + 1 < row_lengths[row] else focus
+    up = offsets[row - 1] + min(col, row_lengths[row - 1] - 1) if row > 0 else focus
+    down = offsets[row + 1] + min(col, row_lengths[row + 1] - 1) if row + 1 < len(row_lengths) else focus
+    return {"left": left, "right": right, "up": up, "down": down}
 
 
 def _publish_png(canvas: Image.Image, output: str) -> None:
@@ -505,12 +599,15 @@ def compose(
     page: int = 0,
     output: str | None = None,
     background: str = DEFAULT_BG,
+    focus: int = 0,
+    open_focus: bool = False,
+    _validated: bool = False,
 ) -> dict[str, Any]:
     if width < 160 or height < 120:
         raise GridError("pane geometry must be at least 160x120 pixels")
     if width * height > MAX_OUTPUT_PIXELS:
         raise GridError(f"output pixel limit exceeded ({width * height} > {MAX_OUTPUT_PIXELS})")
-    checked = validate_job(job)
+    checked = job if _validated else validate_job(job)
     palette = _palette(background)
     if checked["layout"] == "grid":
         pages = _grid_pages(checked, width, height)
@@ -529,19 +626,41 @@ def compose(
     note_lines: list[list[str]] = []
     if checked["layout"] == "grid":
         cols = checked.get("cols") or _default_cols(len(checked["cells"]), width, height)
-        image_area = _render_grid(
-            canvas,
-            pages[actual_page],
-            min(cols, len(pages[actual_page])),
-            rendered,
-            palette,
-            checked["dense"],
-        )
+        page_cells = pages[actual_page]
+        page_cols = min(cols, len(page_cells))
+        row_lengths = [min(page_cols, len(page_cells) - index) for index in range(0, len(page_cells), page_cols)]
+        focus = max(0, min(focus, len(page_cells) - 1))
+        if open_focus:
+            image_area = _render_focused_image(canvas, page_cells[focus])
+        else:
+            image_area = _render_grid(
+                canvas,
+                page_cells,
+                page_cols,
+                rendered,
+                palette,
+                checked["dense"],
+                focus,
+            )
     elif checked["dense"]:
-        cols = _default_cols(len(pages[actual_page]), width, height)
-        image_area = _render_grid(canvas, pages[actual_page], cols, rendered, palette, True)
+        page_cells = pages[actual_page]
+        page_cols = _default_cols(len(page_cells), width, height)
+        row_lengths = [min(page_cols, len(page_cells) - index) for index in range(0, len(page_cells), page_cols)]
+        focus = max(0, min(focus, len(page_cells) - 1))
+        if open_focus:
+            image_area = _render_focused_image(canvas, page_cells[focus])
+        else:
+            image_area = _render_grid(canvas, page_cells, page_cols, rendered, palette, True, focus)
     else:
-        image_area, note_lines = _render_cards(canvas, pages[actual_page], rendered, palette, checked["dense"])
+        page_rows = pages[actual_page]
+        page_cells = [cell for row in page_rows for cell in row["cells"]]
+        row_lengths = [len(row["cells"]) for row in page_rows]
+        page_cols = max(row_lengths)
+        focus = max(0, min(focus, len(page_cells) - 1))
+        if open_focus:
+            image_area = _render_focused_image(canvas, page_cells[focus])
+        else:
+            image_area, note_lines = _render_cards(canvas, page_rows, rendered, palette, checked["dense"], focus)
     if output:
         _publish_png(canvas, output)
     return {
@@ -554,6 +673,11 @@ def compose(
         "image_area_ratio": round(image_area / (width * height), 4),
         "background": palette["background"],
         "text_color": palette["text"],
+        "focus": focus,
+        "focus_navigation": _focus_navigation(row_lengths, focus),
+        "page_cell_count": len(page_cells),
+        "page_cols": page_cols,
+        "open_focus": open_focus,
         "output": output,
     }
 
@@ -596,7 +720,7 @@ def _stage_job_into(job_path: str, root: Path, caption: str) -> Path:
             suffix = ".img"
         target = sources / f"{index:04d}{suffix}"
         _copy_nofollow(cell["path"], target)
-        _image_dimensions(str(target))
+        _image_dimensions(_canonical_leaf_path(str(target)))
         cell["path"] = str(Path("sources") / target.name)
     destination = root / "job.grid.json"
     temp = root / ".job.grid.json.tmp"
@@ -641,6 +765,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--page", type=int, default=0)
     parser.add_argument("--output")
     parser.add_argument("--background", default=DEFAULT_BG)
+    parser.add_argument("--focus", type=int, default=0)
+    parser.add_argument("--open-focus", action="store_true")
     parser.add_argument("--stage-dir")
     parser.add_argument("--caption", default="")
     parser.add_argument("--json", action="store_true")
@@ -653,7 +779,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.width is None or args.height is None or not args.output:
                 raise GridError("--width, --height, and --output are required for composition")
             job = _read_job(args.job)
-            result = compose(job, args.width, args.height, args.page, args.output, args.background)
+            result = compose(
+                job,
+                args.width,
+                args.height,
+                args.page,
+                args.output,
+                args.background,
+                args.focus,
+                args.open_focus,
+                _validated=True,
+            )
     except (OSError, json.JSONDecodeError, GridError) as exc:
         print(f"image-grid: {exc}", file=sys.stderr)
         return 1

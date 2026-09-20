@@ -125,6 +125,99 @@ PY
 check "the composite matches pane pixel geometry" '[[ "$size" == 900x600 ]]'
 check "the composer reports every rendered manifest text" \
   '[[ "$meta" == *'"'"'eye:e003:1024'"'"'* && "$meta" == *'"'"'human clean'"'"'* && "$meta" == *'"'"'CLEAN ORIGINAL'"'"'* && "$meta" == *'"'"'INPUT MARKED CROP'"'"'* && "$meta" == *'"'"'OUTPUT'"'"'* && "$meta" == *'"'"'Human: clean. Grader: not clean (1.381)'"'"'* ]]'
+focus_meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/job.json" --width 900 --height 600 \
+  --focus 2 --output "$ROOT/focus-third.png" --json)
+focus_details=$(printf '%s' "$focus_meta" | "$PYTHON" -c \
+  'import json,sys; d=json.load(sys.stdin); print(d["focus"], d["focus_navigation"]["left"])')
+check "the composer exposes focus and row navigation" '[[ "$focus_details" == "2 1" ]]'
+focus_pixels=$("$PYTHON" - "$ROOT/focus-third.png" <<'PY'
+import sys
+from PIL import Image
+image = Image.open(sys.argv[1])
+pixels = image.load()
+print(sum(1 for y in range(image.height) for x in range(image.width) if pixels[x, y] == (105, 167, 255)))
+PY
+)
+check "the focused grid cell has a visible blue outline" '[[ $focus_pixels -gt 0 ]]'
+open_meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/job.json" --width 900 --height 600 \
+  --focus 2 --open-focus --output "$ROOT/open-third.png" --json)
+open_center=$("$PYTHON" - "$ROOT/open-third.png" <<'PY'
+import sys
+from PIL import Image
+image = Image.open(sys.argv[1])
+print(image.getpixel((image.width // 2, image.height // 2)))
+PY
+)
+check "focused open mode composes the selected source into its own PNG" \
+  '[[ "$open_meta" == *'"'"'"open_focus":true'"'"'* && "$open_center" == "(120, 20, 20)" ]]'
+mkdir -p "$ROOT/focus-alias-real/sources"
+cp "$ROOT/cell2.png" "$ROOT/focus-alias-real/sources/cell.png"
+ln -s "$ROOT/focus-alias-real" "$ROOT/focus-alias"
+printf '{"layout":"grid","cells":[{"path":"%s","label":"alias"}]}' \
+  "$ROOT/focus-alias/sources/cell.png" > "$ROOT/focus-alias-real/job.json"
+alias_meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/focus-alias/job.json" \
+  --width 320 --height 240 --open-focus --output "$ROOT/focus-alias-output.png" --json); rc=$?
+check "pre-existing ancestor aliases bind to their canonical source before rendering" \
+  '[[ $rc -eq 0 && "$alias_meta" == *'"'"'"open_focus":true'"'"'* && -f "$ROOT/focus-alias-output.png" ]]'
+mkdir "$ROOT/stage-alias-real"
+ln -s "$ROOT/stage-alias-real" "$ROOT/stage-alias"
+stage_alias_out=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/job.json" \
+  --stage-dir "$ROOT/stage-alias/job.grid-job" --caption "alias stage"); rc=$?
+check "grid staging works below a pre-existing ancestor alias" \
+  '[[ $rc -eq 0 && "$stage_alias_out" == "$ROOT/stage-alias/job.grid-job/job.grid.json" && -f "$stage_alias_out" ]]'
+cp "$ROOT/cell1.png" "$ROOT/focus-race-source.png"
+printf '%s\n' 'do not read through this symlink' > "$ROOT/focus-race-target"
+printf '{"layout":"grid","cells":[{"path":"%s","label":"race"}]}' \
+  "$ROOT/focus-race-source.png" > "$ROOT/focus-race-job.json"
+race_out=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$COMPOSER" "$ROOT/focus-race-job.json" \
+  "$ROOT/focus-race-source.png" "$ROOT/focus-race-target" "$ROOT/focus-race-output.png" <<'PY'
+import importlib.machinery, importlib.util, os, sys
+loader = importlib.machinery.SourceFileLoader("image_grid", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+job = module._read_job(sys.argv[2])
+os.unlink(sys.argv[3])
+os.symlink(sys.argv[4], sys.argv[3])
+try:
+    module.compose(job, 320, 240, output=sys.argv[5], focus=0, open_focus=True, _validated=True)
+except module.GridError as exc:
+    print(exc)
+else:
+    raise SystemExit("focused open followed a substituted symlink")
+PY
+); rc=$?
+check "focused open refuses a source replaced by a symlink" \
+  '[[ $rc -eq 0 && "$race_out" == *"without following links"* && ! -e "$ROOT/focus-race-output.png" ]]'
+check "focused open never reads or changes the symlink target" \
+  '[[ "$(cat "$ROOT/focus-race-target")" == "do not read through this symlink" ]]'
+mkdir -p "$ROOT/focus-parent/sources" "$ROOT/focus-linked"
+cp "$ROOT/cell1.png" "$ROOT/focus-parent/sources/cell.png"
+cp "$ROOT/cell3.png" "$ROOT/focus-linked/cell.png"
+printf '{"layout":"grid","cells":[{"path":"%s","label":"parent race"}]}' \
+  "$ROOT/focus-parent/sources/cell.png" > "$ROOT/focus-parent-job.json"
+parent_race_out=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$COMPOSER" "$ROOT/focus-parent-job.json" \
+  "$ROOT/focus-parent/sources" "$ROOT/focus-linked" "$ROOT/focus-parent-output.png" <<'PY'
+import importlib.machinery, importlib.util, os, sys
+loader = importlib.machinery.SourceFileLoader("image_grid", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+job = module._read_job(sys.argv[2])
+os.rename(sys.argv[3], sys.argv[3] + "-held")
+os.symlink(sys.argv[4], sys.argv[3])
+try:
+    module.compose(job, 320, 240, output=sys.argv[5], focus=0, open_focus=True, _validated=True)
+except module.GridError as exc:
+    print(exc)
+else:
+    raise SystemExit("focused open followed a substituted parent directory")
+PY
+); rc=$?
+check "focused open refuses a parent directory replaced by a symlink" \
+  '[[ $rc -eq 0 && "$parent_race_out" == *"without following links"* && ! -e "$ROOT/focus-parent-output.png" ]]'
+check "the parent-directory race leaves the linked image unchanged" \
+  'cmp -s "$ROOT/focus-linked/cell.png" "$ROOT/cell3.png"'
 occupancy=$(printf '%s' "$meta" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["image_area_ratio"])')
 check "a 3x3-style comparison row gives images about 75 percent of the page" \
   'python3 -c "raise SystemExit(0 if float('$occupancy') >= 0.74 else 1)"'
@@ -260,6 +353,36 @@ pages50=$(printf '%s' "$meta50" | "$PYTHON" -c 'import json,sys; data=json.load(
 check "a 50-image grid renders through its final screenful" '[[ "${pages50%% *}" -eq "${pages50##* }" && "${pages50##* }" -gt 1 ]]'
 nav=$(IMG_WATCH_LIB=1 bash -c 'source "$1"; cursor=0; active_file=x; last_seen=x; GRID_PAGE=0; GRID_TOTAL=3; handle_key n deck.grid.json; printf "%s " "$GRID_PAGE"; handle_key p deck.grid.json; printf "%s" "$GRID_PAGE"' _ "$WATCH")
 check "n and p move forward and back inside a grid" '[[ "$nav" == "1 0" ]]'
+focus_nav=$(IMG_WATCH_LIB=1 bash -c '
+  source "$1"; cursor=0; last_seen=x; GRID_NAV_RIGHT=1; GRID_NAV_DOWN=3
+  handle_key l deck.grid.json; printf "%s " "$GRID_FOCUS"
+  GRID_NAV_DOWN=3; handle_key j deck.grid.json; printf "%s" "$GRID_FOCUS"
+' _ "$WATCH")
+check "h/j/k/l handlers use the composer row and column targets" '[[ "$focus_nav" == "1 3" ]]'
+open_nav=$(IMG_WATCH_LIB=1 bash -c '
+  source "$1"; cursor=0; last_seen=x; GRID_FOCUS=2; GRID_COUNT=3
+  handle_key ENTER deck.grid.json; printf "%s %s " "$GRID_FOCUS" "$GRID_OPEN"
+  handle_key g deck.grid.json; printf "%s %s" "$GRID_FOCUS" "$GRID_OPEN"
+' _ "$WATCH")
+check "Enter opens the focused source and g restores the same grid focus" \
+  '[[ "$open_nav" == "2 1 2 0" ]]'
+zoom_keys=$(IMG_WATCH_LIB=1 bash -c '
+  source "$1"; cursor=1; active_file=x; last_seen=x; CURRENT_ZOOM=fit
+  handle_key + image.png; printf "%s " "$INTERACTIVE_ZOOM"
+  handle_key n image.png; printf "%s " "$INTERACTIVE_ZOOM"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do handle_key + image.png; done
+  printf "%s " "$INTERACTIVE_ZOOM"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do handle_key - image.png; done
+  printf "%s " "$INTERACTIVE_ZOOM"
+  handle_key 0 image.png; printf "%s" "$INTERACTIVE_ZOOM"
+' _ "$WATCH")
+check "+/- zoom persists across navigation, clamps to 25-400, and 0 returns to fit" \
+  '[[ "$zoom_keys" == "125 125 400 25 fit" ]]'
+resize_signatures=$(IMG_WATCH_LIB=1 bash -c '
+  source "$1"; render_signature image.png "80 24"; printf "\n"; render_signature image.png "100 30"
+' _ "$WATCH")
+check "pane geometry changes invalidate the watcher render signature" \
+  '[[ "${resize_signatures%%$'"'"'\n'"'"'*}" != "${resize_signatures##*$'"'"'\n'"'"'}" ]]'
 
 mkdir -p "$ROOT/runs/a" "$ROOT/runs/b"
 for run in a b; do cp "$ROOT/cell1.png" "$ROOT/runs/$run/clean.png"; cp "$ROOT/cell2.png" "$ROOT/runs/$run/input.png"; cp "$ROOT/cell3.png" "$ROOT/runs/$run/output.png"; done

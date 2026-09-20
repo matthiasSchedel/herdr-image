@@ -6,7 +6,8 @@
 # Kitty graphics handshake and the terminal size are only knowable from inside
 # the pane, and an agent's shell has neither.
 #
-# Keys: n/p page through history, r redraws, q quits.
+# Keys: +/- zoom, 0 fits, n/p page, r redraws, q quits. Grids also use
+# h/j/k/l to move focus, Enter to open a cell, and g to return to the grid.
 set -uo pipefail
 
 E_USAGE=1; E_NORENDER=4; E_NOGRAPHICS=5
@@ -20,7 +21,8 @@ die() {
   exit "$code"
 }
 
-DIR=""; ZOOM="${IMG_ZOOM:-fit}"; POLL="${IMG_POLL:-1}"; RENDERER=""; OWNER_TOKEN=""
+DIR=""; ZOOM="${IMG_ZOOM:-fit}"; DEFAULT_ZOOM="$ZOOM"; POLL="${IMG_POLL:-1}"; RENDERER=""; OWNER_TOKEN=""
+INTERACTIVE_ZOOM=""; CURRENT_ZOOM="fit"
 GRID_TIMEOUT="${IMG_GRID_TIMEOUT:-3}"
 TERMINAL_BACKGROUND="#111318"
 SCRIPT_DIR=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -41,6 +43,7 @@ parse_args() {
     || die "$E_USAGE" "--owner-token is required"
   [[ "$ZOOM" == fit || ( "$ZOOM" =~ ^[0-9]+$ && "$ZOOM" -gt 0 ) ]] \
     || die "$E_USAGE" "--zoom must be fit or a positive integer percent"
+  DEFAULT_ZOOM="$ZOOM"
   [[ "$POLL" =~ ^[0-9]+$ && "$POLL" -gt 0 ]] || die "$E_USAGE" "IMG_POLL must be a positive integer"
   [[ "$GRID_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "$E_USAGE" "IMG_GRID_TIMEOUT must be a positive integer"
   # chafa first, and that order is load-bearing: `kitten icat` asks the terminal
@@ -167,7 +170,7 @@ caption_of() {
 }
 
 zoom_of() {
-  local value="$ZOOM"
+  local value="$DEFAULT_ZOOM"
   [[ -f "$1.zoom" ]] && { IFS= read -r value < "$1.zoom"; } 2>/dev/null
   if [[ "$value" == fit || ( "$value" =~ ^[0-9]+$ && "$value" -gt 0 ) ]]; then
     printf '%s' "$value"
@@ -179,6 +182,13 @@ zoom_of() {
 GRID_PAGE=0
 GRID_TOTAL=1
 GRID_FILE=""
+GRID_FOCUS=0
+GRID_COUNT=0
+GRID_NAV_LEFT=0
+GRID_NAV_RIGHT=0
+GRID_NAV_UP=0
+GRID_NAV_DOWN=0
+GRID_OPEN=0
 composer_with_deadline() {
   python3 - "$GRID_TIMEOUT" "$@" <<'PY'
 import subprocess, sys
@@ -201,41 +211,78 @@ PY
 }
 
 compose_grid_page() {
-  local job="$1" px_w="$2" px_h="$3" stem out answer actual total log
+  local job="$1" px_w="$2" px_h="$3" stem out answer actual total focus count left right up down log meta
+  local -a command
   [[ -x "$COMPOSER" ]] || { printf 'imgrail: grid composer is missing: %s\n' "$COMPOSER" >&2; return 1; }
   type -P python3 >/dev/null 2>&1 || { printf 'imgrail: python3 is required for grids\n' >&2; return 1; }
   stem=$(basename -- "$job"); stem="${stem//[^A-Za-z0-9._-]/_}"
   out="$DIR/.grid-${stem}-${px_w}x${px_h}-${GRID_PAGE}.png"
   log="$DIR/.render.log"
-  answer=$(composer_with_deadline python3 "$COMPOSER" "$job" --width "$px_w" --height "$px_h" \
-    --page "$GRID_PAGE" --background "$TERMINAL_BACKGROUND" --output "$out" 2>>"$log") || return 1
-  actual="${answer%% *}"; total="${answer##* }"
-  [[ "$actual" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]] || return 1
+  command=(python3 "$COMPOSER" "$job" --width "$px_w" --height "$px_h" \
+    --page "$GRID_PAGE" --focus "$GRID_FOCUS" --background "$TERMINAL_BACKGROUND" --output "$out" --json)
+  (( GRID_OPEN == 0 )) || command+=(--open-focus)
+  answer=$(composer_with_deadline "${command[@]}" 2>>"$log") || return 1
+  meta=$(printf '%s' "$answer" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+n = d["focus_navigation"]
+print("\t".join(str(v) for v in (d["page"], d["page_count"], d["focus"],
+    d["page_cell_count"], n["left"], n["right"], n["up"], n["down"])))
+' 2>>"$log") || return 1
+  IFS=$'\t' read -r actual total focus count left right up down <<< "$meta"
+  [[ "$actual" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$total" -gt 0 \
+    && "$focus" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ && "$count" -gt 0 \
+    && "$left" =~ ^[0-9]+$ && "$right" =~ ^[0-9]+$ && "$up" =~ ^[0-9]+$ && "$down" =~ ^[0-9]+$ ]] || return 1
   GRID_PAGE=$((actual - 1)); GRID_TOTAL="$total"
+  GRID_FOCUS="$focus"; GRID_COUNT="$count"
+  GRID_NAV_LEFT="$left"; GRID_NAV_RIGHT="$right"; GRID_NAV_UP="$up"; GRID_NAV_DOWN="$down"
   GRID_FILE="$out"
 }
 
+pane_geometry() {
+  local cols rows
+  cols=$(tput cols 2>/dev/null || printf 80)
+  rows=$(tput lines 2>/dev/null || printf 24)
+  [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]] || cols=80
+  [[ "$rows" =~ ^[0-9]+$ && "$rows" -gt 0 ]] || rows=24
+  printf '%s %s' "$cols" "$rows"
+}
+
+render_signature() {
+  printf '%s:%s:%s:%s:%s:%s' "$1" "$GRID_PAGE" "$GRID_FOCUS" "$GRID_OPEN" "$INTERACTIVE_ZOOM" "$2"
+}
+
 draw() {
-  local file="$1" idx="$2" total="$3" cols rows dims px_w px_h size c r display_file zoom_label
+  local file="$1" idx="$2" total="$3" cols="$4" rows="$5" dims px_w px_h size c r display_file zoom_label keys
   printf '\033[2J\033[H'
   if [[ -z "$file" ]]; then
     printf 'imgrail — no images yet in %s\n' "$(printf '%s' "$DIR" | sanitize_text)"
     return 0
   fi
-  cols=$(tput cols 2>/dev/null || printf 80); rows=$(tput lines 2>/dev/null || printf 24)
   display_file="$file"; GRID_TOTAL=1
   if [[ "$file" == *.grid.json ]]; then
     compose_grid_page "$file" "$(( (cols - 1) * cell_w ))" "$(( (rows - 3) * cell_h ))" \
       || { printf '\033[31mgrid compose failed\033[0m — %s\n' "$(tail -n1 "$DIR/.render.log" 2>/dev/null | sanitize_text)"; return 0; }
     display_file="$GRID_FILE"
-    ZOOM=fit
-    zoom_label="page $((GRID_PAGE + 1))/$GRID_TOTAL"
+    zoom_label="page $((GRID_PAGE + 1))/$GRID_TOTAL, cell $((GRID_FOCUS + 1))/$GRID_COUNT"
+    keys="h/j/k/l move, Enter open, g grid, n/p page, +/- zoom, 0 fit, r redraw, q quit"
+    if (( GRID_OPEN )); then
+      zoom_label="cell $((GRID_FOCUS + 1))/$GRID_COUNT open"
+    fi
   else
-    ZOOM=$(zoom_of "$file")
-    zoom_label="$ZOOM"; [[ "$ZOOM" == fit ]] || zoom_label="${ZOOM}%"
+    CURRENT_ZOOM=$(zoom_of "$file")
+    zoom_label="$CURRENT_ZOOM"; [[ "$CURRENT_ZOOM" == fit ]] || zoom_label="${CURRENT_ZOOM}%"
+    keys="n/p history, +/- zoom, 0 fit, r redraw, q quit"
   fi
-  printf '\033[1m[%s/%s]\033[0m %s \033[2m(%s, n/p/q)\033[0m\n' \
-    "$idx" "$total" "$(caption_of "$file" | sanitize_text)" "$zoom_label"
+  if [[ -n "$INTERACTIVE_ZOOM" ]]; then
+    CURRENT_ZOOM="$INTERACTIVE_ZOOM"
+    zoom_label="$zoom_label, zoom $CURRENT_ZOOM"; [[ "$CURRENT_ZOOM" == fit ]] || zoom_label="${zoom_label}%"
+  elif [[ "$file" == *.grid.json ]]; then
+    CURRENT_ZOOM=fit
+  fi
+  ZOOM="$CURRENT_ZOOM"
+  printf '\033[1m[%s/%s]\033[0m %s \033[2m(%s; %s)\033[0m\n' \
+    "$idx" "$total" "$(caption_of "$file" | sanitize_text)" "$zoom_label" "$keys"
   dims=$(image_px "$display_file" || printf '')
   if [[ -n "$dims" ]]; then
     px_w="${dims%%x*}"; px_h="${dims##*x}"
@@ -258,13 +305,25 @@ draw() {
   fi
 }
 
+adjust_zoom() {
+  local delta="$1" base
+  base="$INTERACTIVE_ZOOM"
+  [[ -n "$base" ]] || base="$CURRENT_ZOOM"
+  [[ "$base" =~ ^[0-9]+$ ]] || base=100
+  base=$((base + delta))
+  (( base < 25 )) && base=25
+  (( base > 400 )) && base=400
+  INTERACTIVE_ZOOM="$base"
+  last_seen=""
+}
+
 handle_key() {
   local key="$1" current_file="${2:-}"
   case "$key" in
     q) return 10 ;;
     n)
       if [[ "$current_file" == *.grid.json && $((GRID_PAGE + 1)) -lt $GRID_TOTAL ]]; then
-        GRID_PAGE=$((GRID_PAGE + 1))
+        GRID_PAGE=$((GRID_PAGE + 1)); GRID_FOCUS=0; GRID_OPEN=0
       elif (( cursor > 0 )); then
         cursor=$((cursor - 1)); active_file=""
       fi
@@ -272,13 +331,26 @@ handle_key() {
       ;;
     p)
       if [[ "$current_file" == *.grid.json && $GRID_PAGE -gt 0 ]]; then
-        GRID_PAGE=$((GRID_PAGE - 1))
+        GRID_PAGE=$((GRID_PAGE - 1)); GRID_FOCUS=0; GRID_OPEN=0
       else
         cursor=$((cursor + 1)); active_file=""
       fi
       last_seen=""
       ;;
     r) last_seen="" ;;
+    +) adjust_zoom 25 ;;
+    -) adjust_zoom -25 ;;
+    0) INTERACTIVE_ZOOM=fit; last_seen="" ;;
+    h) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_LEFT"; GRID_OPEN=0; last_seen=""; } ;;
+    l) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_RIGHT"; GRID_OPEN=0; last_seen=""; } ;;
+    k) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_UP"; GRID_OPEN=0; last_seen=""; } ;;
+    j) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_DOWN"; GRID_OPEN=0; last_seen=""; } ;;
+    ENTER)
+      if [[ "$current_file" == *.grid.json && $GRID_COUNT -gt 0 ]]; then
+        GRID_OPEN=1; last_seen=""
+      fi
+      ;;
+    g) [[ "$current_file" == *.grid.json ]] && { GRID_OPEN=0; last_seen=""; } ;;
   esac
 }
 
@@ -310,22 +382,28 @@ while :; do
   current=""
   while IFS= read -r line; do files+=("$line"); done < <(images)
   total=${#files[@]}
+  geometry=$(pane_geometry); cols="${geometry%% *}"; rows="${geometry##* }"
   if (( total == 0 )); then
-    [[ "$last_seen" == "__empty__" ]] || { draw "" 0 0; last_seen="__empty__"; }
+    signature="__empty__:$geometry"
+    [[ "$last_seen" == "$signature" ]] || { draw "" 0 0 "$cols" "$rows"; last_seen="$signature"; }
   else
     (( cursor >= total )) && cursor=$(( total - 1 ))
     idx=$(( total - 1 - cursor ))
     current="${files[$idx]}"
-    if [[ "$current" != "$active_file" ]]; then GRID_PAGE=0; active_file="$current"; fi
-    signature="$current:$GRID_PAGE"
+    if [[ "$current" != "$active_file" ]]; then
+      GRID_PAGE=0; GRID_FOCUS=0; GRID_OPEN=0; active_file="$current"
+    fi
+    signature=$(render_signature "$current" "$geometry")
     if [[ "$signature" != "$last_seen" ]]; then
-      draw "$current" "$(( idx + 1 ))" "$total"
-      last_seen="$current:$GRID_PAGE"
+      draw "$current" "$(( idx + 1 ))" "$total" "$cols" "$rows"
+      last_seen=$(render_signature "$current" "$geometry")
     fi
   fi
   # One bounded read is both the key handler and the poll interval: no spin,
   # and no separate sleep that would swallow keystrokes.
   key=""
-  IFS= read -r -s -n1 -t "$POLL" key || true
+  if IFS= read -r -s -n1 -t "$POLL" key; then
+    [[ -n "$key" ]] || key=ENTER
+  fi
   handle_key "$key" "$current" || [[ $? -ne 10 ]] || exit 0
 done
