@@ -7,6 +7,7 @@
 # safety argument — after the rail exists, nothing is ever typed into a pane
 # that a human might be using, because nothing is typed at all.
 #
+# Pane rules are nv's, for nv's reasons (see ../../nv/scripts/nv.sh):
 # Herdr is selected by $HERDR_PANE_ID and never by asking which pane is
 # "current", every call is addressed by id, and every input call targets only
 # the pane the preceding `pane split` created.
@@ -70,7 +71,7 @@ check_herdr_timeout() {
     || die "$E_USAGE" "IMG_HERDR_TIMEOUT must be a positive whole number of seconds: $IMG_HERDR_TIMEOUT"
 }
 
-# Absolute and cached: the calls that create a pane run before any
+# Absolute and cached, like nv: the calls that create a pane run before any
 # argument is validated, and a relative PATH entry would resolve elsewhere.
 HERDR_BIN=$(type -P herdr || true)
 JQ_BIN=$(type -P jq || true)
@@ -363,13 +364,12 @@ pane_owned() {
   ' >/dev/null 2>&1
 }
 
-# chafa first: `kitten icat` needs the terminal to report its size in pixels,
-# and a Herdr pane does not. Same order as the rail, so `status` never names a
-# renderer the rail would not pick.
+# The watcher passes its measured pane geometry to kitten, so Kitty terminals
+# can stream the compressed source instead of chafa's expanded RGBA payload.
 renderer() {
   local r
-  r=$(type -P chafa || true);  [[ -n "$r" ]] && { printf 'chafa'; return 0; }
   r=$(type -P kitten || true); [[ -n "$r" ]] && { printf 'kitten'; return 0; }
+  r=$(type -P chafa || true);  [[ -n "$r" ]] && { printf 'chafa'; return 0; }
   return 1
 }
 
