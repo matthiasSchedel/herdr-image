@@ -1,0 +1,55 @@
+#!/bin/zsh
+# agent-shot — screen capture an agent shell can actually take on macOS.
+#
+# Screen Recording is granted to the responsible app, not the shell. A shell
+# under a Herdr server that predates the grant gets only the wallpaper. So the
+# capture runs in a process WezTerm spawns, which inherits WezTerm's grant.
+# The window goes into its own workspace: WezTerm only shows the active one, so
+# the helper never covers the screen or appears in the capture.
+#
+# The grant is checked in that same process, before capturing: a capture
+# without it is wallpaper, and wallpaper must never be shown as a screenshot.
+# --no-remote keeps Peekaboo local; its bridge host neither carries WezTerm's
+# grant nor answers reliably.
+#
+# Exit: 0 captured (prints the path), 1 capture failed, 2 unsupported host,
+# 3 Screen Recording not granted to WezTerm.
+set -u
+out="${1:?usage: agent-shot <out.png> [peekaboo image args...]}"; shift
+[[ "$(uname -s)" == Darwin ]] || { echo "agent-shot: macOS only" >&2; exit 2; }
+W=/Applications/WezTerm.app/Contents/MacOS/wezterm
+[[ -x "$W" ]] || { echo "agent-shot: WezTerm not found" >&2; exit 2; }
+command -v peekaboo >/dev/null || { echo "agent-shot: peekaboo not installed" >&2; exit 2; }
+
+run=$(mktemp -d "${TMPDIR:-/tmp}/agent-shot.XXXXXX") || exit 1
+trap 'rm -rf -- "$run"' EXIT
+rm -f -- "$out"
+cmd="if peekaboo permissions status --json --no-remote 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(p[\"name\"]==\"Screen Recording\" and p[\"isGranted\"] for p in d[\"data\"][\"permissions\"]) else 1)'; then peekaboo image --no-remote ${(j: :)${(q)@}} --path ${(q)out} >/dev/null 2>&1; echo \$? > ${(q)run}/rc; else echo denied > ${(q)run}/rc; fi"
+# Every WezTerm CLI call is bounded: when the GUI stops answering its mux
+# socket, `wezterm cli` blocks forever, and so would every `image shot`.
+bounded() {
+  local secs="$1"; shift
+  "$@" & local pid=$! n=0
+  while kill -0 "$pid" 2>/dev/null && (( n < secs * 10 )); do sleep 0.1; (( n++ )); done
+  if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+  wait "$pid"
+}
+bounded 5 "$W" cli spawn --new-window --workspace agent-shot --cwd /tmp -- /bin/zsh -lc "$cmd" \
+  >"$run/pane" 2>/dev/null
+if (( $? == 124 )); then
+  echo "agent-shot: WezTerm did not answer its CLI within 5s" >&2
+  exit 1
+fi
+pane=$(<"$run/pane")
+i=0
+while (( i < 40 )); do [[ -s "$run/rc" ]] && break; sleep 0.5; (( i++ )); done
+[[ -n "$pane" ]] && bounded 5 "$W" cli kill-pane --pane-id "$pane" >/dev/null 2>&1
+if [[ "$(cat "$run/rc" 2>/dev/null)" == denied ]]; then
+  echo "agent-shot: WezTerm lacks Screen Recording (System Settings > Privacy & Security)" >&2
+  exit 3
+fi
+# Success needs Peekaboo's own exit 0 as well as a file: a failed capture can
+# still leave a partial or wallpaper-only image behind.
+[[ "$(cat "$run/rc" 2>/dev/null)" == 0 && -s "$out" ]] \
+  || { rm -f -- "$out"; echo "agent-shot: capture failed" >&2; exit 1; }
+echo "$out"

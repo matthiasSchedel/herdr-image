@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python3 -m pip install --disable-pip-version-check Pillow
+          if ! command -v jq >/dev/null 2>&1; then
+            if [[ "$(uname -s)" == Darwin ]]; then
+              brew install jq
+            else
+              sudo apt-get update
+              sudo apt-get install -y jq
+            fi
+          fi
+      - name: Test image CLI
+        shell: bash
+        run: /bin/bash tests/test-image-cli.sh
+      - name: Test rail on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: /bin/bash tests/test-img.sh
+      - name: Test rail on macOS Bash 3.2
+        if: runner.os == 'macOS'
+        shell: bash
+        run: IMG_TEST_BASH32=/bin/bash /bin/bash tests/test-img.sh

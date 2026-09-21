@@ -1,0 +1,48 @@
+#!/usr/bin/env zsh
+#compdef image
+
+_image_recent_paths() {
+  local -a recent
+  recent=("${(@f)$(command image ls --paths-only 2>/dev/null)}")
+  (( ${#recent} )) && compadd -Q -X 'recent images' -- "${recent[@]}"
+  _files -g '*.(png|PNG|jpg|JPG|jpeg|JPEG|gif|GIF|webp|WEBP|bmp|BMP|tif|TIF|tiff|TIFF)'
+}
+
+local context state state_descr line
+typeset -A opt_args
+local -a commands
+commands=(
+  'ls:list recent showable images'
+  'last:show the newest recent image'
+  'shot:capture and show the screen'
+  'grid:compose and show several images'
+)
+
+_arguments -C \
+  '(-s -m -l)'{-s,-m,-l}'[100%, fit, or 200% size]' \
+  '--zoom=[explicit zoom percent]:percent:' \
+  '1:command or image:->first' \
+  '*:argument:->args'
+
+case "$state" in
+  first)
+    _describe -t commands 'image command' commands
+    _image_recent_paths
+    ;;
+  args)
+    case "$words[2]" in
+      grid)
+        _arguments \
+          '--cols=[column count]:columns:' \
+          '--manifest=[JSON manifest]:manifest:_files -g "*.json"' \
+          '--pattern=[brace glob]:pattern:' \
+          '--labels=[comma-separated labels]:labels:' \
+          '--dense[remove all grid text for an image wall]' \
+          '*:image:_image_recent_paths'
+        ;;
+      shot) _message 'caption' ;;
+      ls|last) ;;
+      *) _message 'caption' ;;
+    esac
+    ;;
+esac
