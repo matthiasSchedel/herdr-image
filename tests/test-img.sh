@@ -3,7 +3,6 @@
 # quotes are deliberate, and their variables look unused to shellcheck.
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
-export PYTHONDONTWRITEBYTECODE=1
 
 PYTHON_SITE="$(python3 -c 'import os, PIL; print(os.path.dirname(os.path.dirname(PIL.__file__)))')"
 export PYTHONPATH="$PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}"
@@ -11,6 +10,7 @@ export PYTHONPATH="$PYTHON_SITE${PYTHONPATH:+:$PYTHONPATH}"
 REPO_ROOT="$(cd -P "$(dirname "$0")/.." && pwd -P)"
 SKILL_DIR="$REPO_ROOT/skills/show-image"
 IMG="$SKILL_DIR/scripts/img.sh"
+IMG_ALIAS="$REPO_ROOT/skills/img/scripts/img.sh"
 WATCH="$SKILL_DIR/scripts/imgrail-watch.sh"
 COMPOSER="$SKILL_DIR/scripts/image-grid.py"
 PASS=0
@@ -42,8 +42,6 @@ private_dirs() {
 
 ROOT="$(mktemp -d)"
 trap 'rm -rf "$ROOT"' EXIT
-ln -s "$SKILL_DIR" "$ROOT/show-image-alias"
-IMG_ALIAS="$ROOT/show-image-alias/scripts/img.sh"
 BIN="$ROOT/bin"
 LOG="$ROOT/calls.log"
 TEST_HOME="$ROOT/home"
@@ -174,9 +172,7 @@ check "and says why" '[[ "$out" == *HERDR_PANE_ID* ]]'
 mkdir -p "$ROOT/norender"
 ln -sf "$BIN/herdr" "$ROOT/norender/herdr"
 ln -sf "$(type -P jq)" "$ROOT/norender/jq"
-for command_name in dirname mkdir chmod; do
-  ln -sf "$(type -P "$command_name")" "$ROOT/norender/$command_name"
-done
+for tool in dirname mkdir chmod; do ln -sf "$(type -P "$tool")" "$ROOT/norender/$tool"; done
 out=$(PATH="$ROOT/norender" "$IMG" show "$ROOT/pic.png" 2>&1); rc=$?
 check "no renderer refuses with exit 4" '[[ $rc -eq 4 ]]'
 check "and names the renderer" '[[ "$out" == *renderer* ]]'
@@ -259,7 +255,7 @@ check "the rail command is the watcher" 'grep -q "imgrail-watch.sh" "$LOG"'
 check "the watcher is aimed at the just-split pane" \
   '[[ $(grep "pane run wT:p9 exec" "$LOG" | wc -l) -eq 1 ]]'
 
-# The load-bearing assertion: input goes to exactly one
+# The load-bearing assertion, same shape as nv's: input goes to exactly one
 # pane, and it is the one the split created.
 runs=$(grep -c "^herdr pane run " "$LOG")
 probe_runs=$(grep -c "^herdr pane run wT:p9 printf" "$LOG")
@@ -655,6 +651,36 @@ rm -f "$CACHE"/*pic.png.zoom 2>/dev/null || true
 out=$("$IMG" show "$ROOT/staged.png" 2>&1); rc=$?
 default_zoom=$(find "$CACHE" -name "*staged.png.zoom" -exec cat {} \; | tail -n1)
 check "img.sh defaults to fit behavior" '[[ $rc -eq 0 && "$default_zoom" == fit ]]'
+
+# A command substitution gives tput a pipe rather than the rail tty. A
+# terminfo implementation may then return its 80x24 default, which must not
+# override the pane's real size from stty. If both live queries are silent,
+# the geometry learned from the terminal handshake remains usable.
+GEOMETRY_BIN="$ROOT/geometry-bin"
+mkdir -p "$GEOMETRY_BIN"
+cat > "$GEOMETRY_BIN/tput" <<'SH'
+#!/usr/bin/env bash
+if [[ "${IMG_TEST_TPUT_SILENT:-0}" == 1 ]]; then exit 1; fi
+case "${1:-}" in
+  cols) printf '80\n' ;;
+  lines) printf '24\n' ;;
+  *) exit 1 ;;
+esac
+SH
+cat > "$GEOMETRY_BIN/stty" <<'SH'
+#!/usr/bin/env bash
+[[ "${1:-}" == size ]] || exit 1
+[[ -n "${IMG_TEST_STTY_SIZE:-}" ]] || exit 1
+printf '%s\n' "$IMG_TEST_STTY_SIZE"
+SH
+chmod +x "$GEOMETRY_BIN/tput" "$GEOMETRY_BIN/stty"
+geometry=$(PATH="$GEOMETRY_BIN:$PATH" IMG_WATCH_LIB=1 IMG_TEST_STTY_SIZE='40 164' \
+  bash -c 'source "$1"; pane_geometry' _ "$WATCH")
+check "the pane tty size beats tput's 80x24 terminfo default" '[[ "$geometry" == "164 40" ]]'
+geometry=$(PATH="$GEOMETRY_BIN:$PATH" IMG_WATCH_LIB=1 IMG_TEST_STTY_SIZE='' \
+  IMG_TEST_TPUT_SILENT=1 bash -c \
+  'source "$1"; terminal_cols=100; terminal_rows=30; pane_geometry' _ "$WATCH")
+check "silent live geometry falls back to the terminal handshake" '[[ "$geometry" == "100 30" ]]'
 
 # Every string derived from a file or child process is scrubbed before it can
 # reach the rail tty. OSC 52 and line-control bytes must become inert text.

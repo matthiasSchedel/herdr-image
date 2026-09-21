@@ -40,7 +40,7 @@ def _skill_script() -> Path:
 
 def _install_zsh_completion() -> None:
     """Register the shipped completion in the user's existing Oh My Zsh path."""
-    source = _real_script_dir().parent / "completions" / "_image"
+    source = _real_script_dir() / "_image"
     oh_my_zsh = Path.home() / ".oh-my-zsh"
     if not source.is_file() or not oh_my_zsh.is_dir():
         return
@@ -369,7 +369,7 @@ def _agent_shot(output: Path) -> bool:
     helper = Path(configured).expanduser() if configured else Path.home() / ".local" / "bin" / "agent-shot"
     if not helper.is_file() or not os.access(helper, os.X_OK):
         return False
-    # The helper takes the output path as its first positional argument.
+    # The fleet helper takes the output path as its first positional argument.
     # It launches Peekaboo through WezTerm so macOS applies WezTerm's Screen
     # Recording grant rather than the unprivileged agent shell's grant.
     # The helper checks the Screen Recording grant inside that WezTerm process

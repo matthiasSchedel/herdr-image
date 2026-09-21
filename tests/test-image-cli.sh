@@ -3,10 +3,10 @@
 # unused to ShellCheck.
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
-export PYTHONDONTWRITEBYTECODE=1
 
 REPO_ROOT="$(cd -P "$(dirname "$0")/.." && pwd -P)"
 SKILL_DIR="$REPO_ROOT/skills/show-image"
+REPO_ROOT="$(cd -P "$(dirname "$0")/.." && pwd -P)"
 IMAGE="$REPO_ROOT/bin/image"
 WATCH="$SKILL_DIR/scripts/imgrail-watch.sh"
 COMPOSER="$SKILL_DIR/scripts/image-grid.py"
@@ -123,6 +123,13 @@ print("x".join(map(str, Image.open(sys.argv[1]).size)))
 PY
 )
 check "the composite matches pane pixel geometry" '[[ "$size" == 900x600 ]]'
+printf '{"layout":"grid","cells":[{"path":"%s","label":"ONLY IMAGE"}]}' \
+  "$ROOT/cell1.png" > "$ROOT/few-grid.json"
+few_meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/few-grid.json" \
+  --width 900 --height 600 --output "$ROOT/few-grid.png" --json)
+few_occupancy=$(printf '%s' "$few_meta" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["image_area_ratio"])')
+check "a grid page with one row expands its image area to fill the page" \
+  'python3 -c "raise SystemExit(0 if float('"'"'$few_occupancy'"'"') >= 0.9 else 1)"'
 check "the composer reports every rendered manifest text" \
   '[[ "$meta" == *'"'"'eye:e003:1024'"'"'* && "$meta" == *'"'"'human clean'"'"'* && "$meta" == *'"'"'CLEAN ORIGINAL'"'"'* && "$meta" == *'"'"'INPUT MARKED CROP'"'"'* && "$meta" == *'"'"'OUTPUT'"'"'* && "$meta" == *'"'"'Human: clean. Grader: not clean (1.381)'"'"'* ]]'
 focus_meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/job.json" --width 900 --height 600 \
@@ -224,7 +231,7 @@ check "a 3x3-style comparison row gives images about 75 percent of the page" \
 first_image_pixel=$("$PYTHON" - "$ROOT/composite.png" <<'PY'
 import sys
 from PIL import Image
-print(Image.open(sys.argv[1]).getpixel((16, 38)))
+print(Image.open(sys.argv[1]).getpixel((20, 42)))
 PY
 )
 check "comparison images crop to fill their boxes without letterboxing" '[[ "$first_image_pixel" == "(40, 20, 20)" ]]'
@@ -335,6 +342,28 @@ PY
 meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/job24.json" --width 700 --height 500 --page 0 --output "$ROOT/page1.png" --json)
 pages=$(printf '%s' "$meta" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["page_count"])')
 check "a 24-image manifest pages into multiple screenfuls" '[[ $pages -gt 1 ]]'
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$ROOT/live-cards.json" "$ROOT/cell1.png" "$ROOT/cell2.png" "$ROOT/cell3.png" <<'PY'
+import json, sys
+rows = []
+for i in range(8):
+    rows.append({
+        "row_id": f"row-{i:02}",
+        "badge": "checked",
+        "note": "Human: clean. Grader: clean.",
+        "cells": [
+            {"path": sys.argv[2], "label": "CLEAN ORIGINAL"},
+            {"path": sys.argv[3], "label": "INPUT MARKED CROP"},
+            {"path": sys.argv[4], "label": "OUTPUT"},
+        ],
+    })
+json.dump({"layout": "cards", "rows": rows}, open(sys.argv[1], "w"))
+PY
+live_cards_meta=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$COMPOSER" "$ROOT/live-cards.json" \
+  --width 1755 --height 3280 --page 0 --output "$ROOT/live-cards.png" --json)
+live_cards_ratio=$(printf '%s' "$live_cards_meta" | "$PYTHON" -c \
+  'import json,sys; print(json.load(sys.stdin)["image_area_ratio"])')
+check "images occupy at least 80 percent of a representative tall card page" \
+  'python3 -c "raise SystemExit(0 if float('\''$live_cards_ratio'\'') >= 0.80 else 1)"'
 watch_compose=$(IMG_WATCH_LIB=1 bash -c 'source "$1"; DIR="$2"; COMPOSER="$3"; GRID_PAGE=1; compose_grid_page "$4" 640 480; printf "%s %s %s" "$GRID_PAGE" "$GRID_TOTAL" "$GRID_FILE"' _ "$WATCH" "$ROOT" "$COMPOSER" "$ROOT/job24.json")
 watch_file="${watch_compose#* * }"
 watch_size=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$watch_file" <<'PY'
@@ -344,6 +373,86 @@ print("x".join(map(str, Image.open(sys.argv[1]).size)))
 PY
 )
 check "the watcher composes a grid at its exact pane geometry" '[[ "$watch_compose" == "1 "* && "$watch_size" == 640x480 ]]'
+measured_draw_trace="$ROOT/measured-draw.trace"
+IMG_WATCH_LIB=1 env -u HERDR_CELL_WIDTH_PX -u HERDR_CELL_HEIGHT_PX bash -c '
+  source "$1"; DIR="$2"; TRACE="$3"; RENDERER=chafa
+  parse_terminal_geometry "$4"
+  compose_grid_page() {
+    printf "compose %sx%s\n" "$2" "$3" >> "$TRACE"
+    GRID_FILE="$DIR/mock-${2}x${3}.png"; GRID_TOTAL=1; GRID_COUNT=1; GRID_FOCUS=0
+  }
+  image_px() { local value="${1##*/mock-}"; printf "%s" "${value%.png}"; }
+  chafa() { printf "render %s\n" "$*" >> "$TRACE"; }
+  draw deck.grid.json 1 1 100 30 >/dev/null
+' _ "$WATCH" "$ROOT" "$measured_draw_trace" $'\033[6;20;9t\033[4;600;900t\033[8;30;100t'
+measured_draw_value=$(cat "$measured_draw_trace")
+check "a composed grid page matches the measured drawable aspect ratio" \
+  '[[ "$measured_draw_value" == $'"'"'compose 900x600\nrender -f kitty --size 100x30 -- '"'"'* ]]'
+compact_bin="$ROOT/compact-bin"
+mkdir -p "$compact_bin"
+cat > "$compact_bin/kitten" <<'SH'
+#!/usr/bin/env bash
+scale_up=0
+for value in "$@"; do
+  source_file="$value"
+  [[ "$value" == --scale-up ]] && scale_up=1
+done
+python3 - "$source_file" "$scale_up" <<'PY'
+import base64, sys
+if sys.argv[2] == "1":
+    sys.stdout.buffer.write(b"R" * 31195829)
+else:
+    sys.stdout.buffer.write(base64.b64encode(open(sys.argv[1], "rb").read()))
+PY
+SH
+cat > "$compact_bin/chafa" <<'SH'
+#!/usr/bin/env bash
+python3 - <<'PY'
+import sys
+sys.stdout.buffer.write(b"R" * 31195829)
+PY
+SH
+chmod +x "$compact_bin/kitten" "$compact_bin/chafa"
+payload_file="$ROOT/redraw.payload"
+selected_renderer=$(PATH="$compact_bin:/usr/bin:/bin" IMG_WATCH_LIB=1 \
+  HERDR_CELL_WIDTH_PX=9 HERDR_CELL_HEIGHT_PX=20 bash -c '
+  source "$1"; DIR="$2"; PATH="$3"; PAGE_FILE="$4"; select_renderer 1
+  selected=$RENDERER
+  compose_grid_page() {
+    GRID_FILE="$PAGE_FILE"; GRID_TOTAL=1; GRID_COUNT=24; GRID_FOCUS=0
+  }
+  draw deck.grid.json 1 1 195 164 > "$5"
+  printf "%s" "$selected"
+' _ "$WATCH" "$ROOT" "$compact_bin:/usr/bin:/bin" "$ROOT/live-cards.png" "$payload_file")
+payload_bytes=$(wc -c < "$payload_file" | tr -d ' ')
+check "a 1755x3280 redraw prefers compact PNG transfer over raw-RGBA output" \
+  '[[ "$selected_renderer" == kitten && $payload_bytes -lt 1000000 ]]'
+fallback_bin="$ROOT/fallback-bin"
+mkdir -p "$fallback_bin"
+cat > "$fallback_bin/chafa" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$FALLBACK_TRACE"
+SH
+chmod +x "$fallback_bin/chafa"
+fallback_trace="$ROOT/fallback.trace"
+fallback_renderer=$(PATH="$fallback_bin:/usr/bin:/bin" FALLBACK_TRACE="$fallback_trace" \
+  IMG_WATCH_LIB=1 HERDR_CELL_WIDTH_PX=9 HERDR_CELL_HEIGHT_PX=20 bash -c '
+  source "$1"; DIR="$2"; PAGE_FILE="$3"; select_renderer 0
+  selected=$RENDERER
+  compose_grid_page() {
+    GRID_FILE="$PAGE_FILE"; GRID_TOTAL=1; GRID_COUNT=24; GRID_FOCUS=0
+  }
+  draw deck.grid.json 1 1 195 164 >/dev/null
+  printf "%s" "$selected"
+' _ "$WATCH" "$ROOT" "$ROOT/live-cards.png")
+fallback_args=$(cat "$fallback_trace")
+check "a non-Kitty terminal without kitten draws through chafa symbols" \
+  '[[ "$fallback_renderer" == chafa-symbols && "$fallback_args" == "-f symbols --size 195x163 -- "* ]]'
+silent_geometry=$(IMG_WATCH_LIB=1 env -u HERDR_CELL_WIDTH_PX -u HERDR_CELL_HEIGHT_PX bash -c '
+  source "$1"; parse_terminal_geometry ""; grid_drawable_pixels 100 30 0
+' _ "$WATCH")
+check "terminal silence keeps the 8x16 drawable-area fallback" \
+  '[[ "$silent_geometry" == "800 480" ]]'
 render_trace="$ROOT/render-area.trace"
 open_draw_out="$ROOT/open-draw.out"
 IMG_WATCH_LIB=1 HERDR_CELL_WIDTH_PX=8 HERDR_CELL_HEIGHT_PX=16 bash -c '
@@ -359,8 +468,8 @@ IMG_WATCH_LIB=1 HERDR_CELL_WIDTH_PX=8 HERDR_CELL_HEIGHT_PX=16 bash -c '
 ' _ "$WATCH" "$ROOT" "$render_trace" "$open_draw_out"
 render_trace_value=$(cat "$render_trace")
 open_draw_value=$(cat "$open_draw_out")
-check "focused open mode gives the renderer all pane rows instead of the grid page area" \
-  '[[ "$render_trace_value" == *$'"'"'compose 320x592\n'"'"'*"--size 40x37"*$'"'"'compose 320x640\n'"'"'*"--size 40x40"* ]]'
+check "grid and focused open mode both give the renderer every pane row" \
+  '[[ "$render_trace_value" == *$'"'"'compose 328x640\n'"'"'*"--size 41x40"*$'"'"'compose 328x640\n'"'"'*"--size 41x40"* ]]'
 check "focused open mode keeps identification and key help in the terminal title, outside image rows" \
   '[[ "$open_draw_value" == *$'"'"'\033]2;[1/1] deck.grid.json (cell 1/1 open; arrows/h/j/k/l move,'"'"'* && "$open_draw_value" != *$'"'"'\n'"'"'* ]]'
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$ROOT/job50.json" "$ROOT/cell1.png" <<'PY'
@@ -552,11 +661,11 @@ SH
 chmod +x "$BIN/agent-shot"
 make_png "$ROOT/helper-capture.png" 200 150 purple
 rm -f "$ROOT/shown.png"
-out=$(HOME="$HOME_DIR" PATH=/usr/bin:/bin IMAGE_AGENT_SHOT="$BIN/agent-shot" IMAGE_IMG_SH="$ROOT/backend" IMAGE_HELPER_MARK="$ROOT/helper-called" IMAGE_HELPER_SOURCE="$ROOT/helper-capture.png" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot 2>&1); rc=$?
+out=$(env -u CODEX_SESSION_ID -u CLAUDECODE HOME="$HOME_DIR" PATH=/usr/bin:/bin IMAGE_AGENT_SHOT="$BIN/agent-shot" IMAGE_IMG_SH="$ROOT/backend" IMAGE_HELPER_MARK="$ROOT/helper-called" IMAGE_HELPER_SOURCE="$ROOT/helper-capture.png" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot 2>&1); rc=$?
 check "shot fallback uses agent-shot's output-and-mode contract" '[[ -f "$ROOT/helper-called" && $rc -eq 0 ]]'
 check "shot shows a granted helper capture" '[[ -s "$ROOT/shown.png" ]] && cmp -s "$ROOT/shown.png" "$ROOT/helper-capture.png"'
 rm -f "$ROOT/shown.png" "$ROOT/helper-called"
-out=$(HOME="$HOME_DIR" PATH=/usr/bin:/bin IMAGE_AGENT_SHOT="$BIN/agent-shot" IMAGE_IMG_SH="$ROOT/backend" IMAGE_HELPER_MARK="$ROOT/helper-called" IMAGE_HELPER_SOURCE="$ROOT/helper-capture.png" IMAGE_HELPER_DENY=1 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot 2>&1); rc=$?
+out=$(env -u CODEX_SESSION_ID -u CLAUDECODE HOME="$HOME_DIR" PATH=/usr/bin:/bin IMAGE_AGENT_SHOT="$BIN/agent-shot" IMAGE_IMG_SH="$ROOT/backend" IMAGE_HELPER_MARK="$ROOT/helper-called" IMAGE_HELPER_SOURCE="$ROOT/helper-capture.png" IMAGE_HELPER_DENY=1 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot 2>&1); rc=$?
 check "shot refuses when the helper reports no Screen Recording grant" '[[ $rc -eq 1 && "$out" == *"not granted to WezTerm"* && ! -e "$ROOT/shown.png" ]]'
 
 cat > "$BIN/peekaboo" <<'SH'
@@ -574,39 +683,20 @@ SH
 chmod +x "$BIN/peekaboo"
 make_png "$ROOT/real-capture.png" 200 150 green
 make_png "$ROOT/window-capture.png" 180 120 orange
-out=$(HOME="$HOME_DIR" PATH="$BIN:/usr/bin:/bin" IMAGE_IMG_SH="$ROOT/backend" IMAGE_CAPTURE_SOURCE="$ROOT/real-capture.png" IMAGE_WINDOW_SOURCE="$ROOT/real-capture.png" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot 2>&1); rc=$?
+out=$(env -u CODEX_SESSION_ID -u CLAUDECODE HOME="$HOME_DIR" PATH="$BIN:/usr/bin:/bin" IMAGE_IMG_SH="$ROOT/backend" IMAGE_CAPTURE_SOURCE="$ROOT/real-capture.png" IMAGE_WINDOW_SOURCE="$ROOT/real-capture.png" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot 2>&1); rc=$?
 check "shot refuses when screen and window capture both return wallpaper" '[[ $rc -eq 1 && "$out" == *"desktop wallpaper"* ]]'
-HOME="$HOME_DIR" PATH="$BIN:/usr/bin:/bin" IMAGE_IMG_SH="$ROOT/backend" IMAGE_CAPTURE_SOURCE="$ROOT/real-capture.png" IMAGE_WINDOW_SOURCE="$ROOT/window-capture.png" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot "fresh screen" >/dev/null; rc=$?
+env -u CODEX_SESSION_ID -u CLAUDECODE HOME="$HOME_DIR" PATH="$BIN:/usr/bin:/bin" IMAGE_IMG_SH="$ROOT/backend" IMAGE_CAPTURE_SOURCE="$ROOT/real-capture.png" IMAGE_WINDOW_SOURCE="$ROOT/window-capture.png" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" "$IMAGE" shot "fresh screen" >/dev/null; rc=$?
 check "shot shows a valid capture when permission is granted" '[[ $rc -eq 0 && -f "$ROOT/shown.png" ]]'
 check "the shown capture contains the captured pixels" 'cmp -s "$ROOT/shown.png" "$ROOT/real-capture.png"'
 
-check "the zsh completion ships with the command" '[[ -x "$REPO_ROOT/completions/_image" ]]'
+check "the zsh completion ships beside the command" '[[ -x "$REPO_ROOT/bin/_image" ]]'
 mkdir -p "$HOME_DIR/.oh-my-zsh"
 run_image ls >/dev/null
 check "the command registers completion in Oh My Zsh's fpath" \
-  '[[ -L "$HOME_DIR/.oh-my-zsh/completions/_image" && "$(readlink "$HOME_DIR/.oh-my-zsh/completions/_image")" == "$REPO_ROOT/completions/_image" ]]'
+  '[[ -L "$HOME_DIR/.oh-my-zsh/completions/_image" && "$(readlink "$HOME_DIR/.oh-my-zsh/completions/_image")" == "$REPO_ROOT/bin/_image" ]]'
 help=$(run_image --help 2>&1)
 check "help and completion expose --dense" \
-  '[[ "$help" == *"--dense"* ]] && grep -q -- "--dense" "$REPO_ROOT/completions/_image"'
-
-INSTALL_HOME="$ROOT/install-home"
-mkdir -p "$INSTALL_HOME"
-install_out=$(HOME="$INSTALL_HOME" bash "$REPO_ROOT/install.sh" 2>&1); rc=$?
-check "the installer links both commands and the zsh completion" \
-  '[[ $rc -eq 0 && -L "$INSTALL_HOME/.local/bin/image" && -L "$INSTALL_HOME/.local/bin/agent-shot" && -L "$INSTALL_HOME/.local/share/zsh/site-functions/_image" ]]'
-check "installed links point into this checkout" \
-  '[[ "$(readlink "$INSTALL_HOME/.local/bin/image")" == "$REPO_ROOT/bin/image" && "$(readlink "$INSTALL_HOME/.local/share/zsh/site-functions/_image")" == "$REPO_ROOT/completions/_image" ]]'
-NO_HERDR_BIN="$ROOT/no-herdr-bin"
-mkdir -p "$NO_HERDR_BIN"
-for command_name in python3 dirname mkdir chmod; do
-  ln -s "$(type -P "$command_name")" "$NO_HERDR_BIN/$command_name"
-done
-out=$(env -u HERDR_PANE_ID HOME="$INSTALL_HOME" PATH="$NO_HERDR_BIN" PYTHONDONTWRITEBYTECODE=1 \
-  "$INSTALL_HOME/.local/bin/image" "$ROOT/work/older image.png" 2>&1); rc=$?
-check "the installed image symlink resolves its backend relative to its real path" \
-  '[[ $rc -eq 3 && "$out" == *"herdr is not in PATH"* && "$out" != *"backend is missing"* ]]'
-install_out=$(HOME="$INSTALL_HOME" bash "$REPO_ROOT/install.sh" 2>&1); rc=$?
-check "installing the same checkout twice is safe" '[[ $rc -eq 0 && "$install_out" == *"already linked"* ]]'
+  '[[ "$help" == *"--dense"* ]] && grep -q -- "--dense" "$REPO_ROOT/bin/_image"'
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

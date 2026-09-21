@@ -325,7 +325,7 @@ def _card_height(
     note_height = len(note_lines) * max(18, getattr(note_font, "size", 15) + 3)
     cells = len(row["cells"])
     cell_width = max(1, (inner - 16 - (cells - 1) * 8) // cells)
-    image_height = max(100, min(260, int(cell_width * 0.8), height // 2))
+    image_height = max(100, min(int(cell_width * 0.8), height // 2))
     return 30 + image_height + 24 + note_height + 16
 
 
@@ -335,15 +335,15 @@ def _card_pages(job: dict[str, Any], width: int, height: int) -> list[list[dict[
     note_font = _font(max(13, min(18, width // 70)))
     pages: list[list[dict[str, Any]]] = []
     page: list[dict[str, Any]] = []
-    used = 8
+    used = 4
     for row in job["rows"]:
         needed = _card_height(draw, row, width, height, note_font)
-        if page and used + needed + 8 > height - 8:
+        if page and used + needed + 6 > height - 4:
             pages.append(page)
             page = []
-            used = 8
+            used = 4
         page.append(row)
-        used += needed + 8
+        used += needed + 6
     if page:
         pages.append(page)
     return pages
@@ -414,7 +414,7 @@ def _render_grid(
 ) -> int:
     draw = ImageDraw.Draw(canvas)
     width, height = canvas.size
-    margin, gap = (0, 2) if dense else (8, 8)
+    margin, gap = (0, 2) if dense else (4, 6)
     rows = max(1, math.ceil(len(cells) / cols))
     cell_w = max(1, (width - 2 * margin - (cols - 1) * gap) // cols)
     cell_h = max(1, (height - 2 * margin - (rows - 1) * gap) // rows)
@@ -429,11 +429,11 @@ def _render_grid(
             draw.rounded_rectangle(
                 (x, y, x + cell_w, y + cell_h), 8, fill=palette["card"], outline=palette["edge"], width=1
             )
-        image_w = cell_w if dense else max(1, cell_w - 8)
-        image_h = cell_h if dense else max(1, cell_h - label_h - 8)
+        image_w = cell_w if dense else max(1, cell_w - 6)
+        image_h = cell_h if dense else max(1, cell_h - label_h - 6)
         fitted = _cover(_open_image(cell["path"]), image_w, image_h)
-        ix = x if dense else x + 4
-        iy = y if dense else y + 4
+        ix = x if dense else x + 3
+        iy = y if dense else y + 3
         canvas.paste(fitted, (ix, iy))
         image_area += image_w * image_h
         if not dense:
@@ -469,7 +469,7 @@ def _render_cards(
         cols = _default_cols(len(cells), width, height)
         return _render_grid(canvas, cells, cols, rendered, palette, True, focus), []
     draw = ImageDraw.Draw(canvas)
-    margin, gap = 8, 8
+    margin, gap = 4, 6
     row_id_font = _font(max(14, min(19, width // 62)), mono=True)
     badge_font = _font(max(12, min(16, width // 72)))
     label_font = _font(max(12, min(17, width // 70)))
