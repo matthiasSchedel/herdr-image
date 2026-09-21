@@ -344,6 +344,25 @@ print("x".join(map(str, Image.open(sys.argv[1]).size)))
 PY
 )
 check "the watcher composes a grid at its exact pane geometry" '[[ "$watch_compose" == "1 "* && "$watch_size" == 640x480 ]]'
+render_trace="$ROOT/render-area.trace"
+open_draw_out="$ROOT/open-draw.out"
+IMG_WATCH_LIB=1 HERDR_CELL_WIDTH_PX=8 HERDR_CELL_HEIGHT_PX=16 bash -c '
+  source "$1"; DIR="$2"; TRACE="$3"; RENDERER=chafa
+  compose_grid_page() {
+    printf "compose %sx%s\n" "$2" "$3" >> "$TRACE"
+    GRID_FILE="$DIR/mock-${2}x${3}.png"; GRID_TOTAL=1; GRID_COUNT=1; GRID_FOCUS=0
+  }
+  image_px() { local value="${1##*/mock-}"; printf "%s" "${value%.png}"; }
+  chafa() { printf "render %s\n" "$*" >> "$TRACE"; }
+  GRID_OPEN=0; draw deck.grid.json 1 1 41 40 >/dev/null
+  GRID_OPEN=1; draw deck.grid.json 1 1 41 40 > "$4"
+' _ "$WATCH" "$ROOT" "$render_trace" "$open_draw_out"
+render_trace_value=$(cat "$render_trace")
+open_draw_value=$(cat "$open_draw_out")
+check "focused open mode gives the renderer all pane rows instead of the grid page area" \
+  '[[ "$render_trace_value" == *$'"'"'compose 320x592\n'"'"'*"--size 40x37"*$'"'"'compose 320x640\n'"'"'*"--size 40x40"* ]]'
+check "focused open mode keeps identification and key help in the terminal title, outside image rows" \
+  '[[ "$open_draw_value" == *$'"'"'\033]2;[1/1] deck.grid.json (cell 1/1 open; arrows/h/j/k/l move,'"'"'* && "$open_draw_value" != *$'"'"'\n'"'"'* ]]'
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$ROOT/job50.json" "$ROOT/cell1.png" <<'PY'
 import json, sys
 json.dump({"layout":"grid", "cols":None, "cells":[{"path":sys.argv[2], "label":f"image-{i:02}"} for i in range(50)]}, open(sys.argv[1], "w"))
@@ -359,6 +378,88 @@ focus_nav=$(IMG_WATCH_LIB=1 bash -c '
   GRID_NAV_DOWN=3; handle_key j deck.grid.json; printf "%s" "$GRID_FOCUS"
 ' _ "$WATCH")
 check "h/j/k/l handlers use the composer row and column targets" '[[ "$focus_nav" == "1 3" ]]'
+arrow_nav=$(IMG_WATCH_LIB=1 bash -c '
+  source "$1"; cursor=0; last_seen=x
+  GRID_NAV_LEFT=1; GRID_NAV_DOWN=2; GRID_NAV_UP=3; GRID_NAV_RIGHT=4
+  handle_key LEFT deck.grid.json; printf "%s " "$GRID_FOCUS"
+  handle_key DOWN deck.grid.json; printf "%s " "$GRID_FOCUS"
+  handle_key UP deck.grid.json; printf "%s " "$GRID_FOCUS"
+  handle_key RIGHT deck.grid.json; printf "%s" "$GRID_FOCUS"
+' _ "$WATCH")
+check "arrow handlers use the same grid targets as h/j/k/l" '[[ "$arrow_nav" == "1 2 3 4" ]]'
+decoder_report=$(PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$WATCH" "$BASH" <<'PY'
+import os
+import select
+import subprocess
+import sys
+import time
+
+watch = sys.argv[1]
+bash = sys.argv[2]
+script = r'''
+source "$1"
+count="$2"
+i=0
+while (( i < count )); do
+  if read_terminal_key 1; then printf '%s\n' "$READ_KEY"; fi
+  i=$((i + 1))
+done
+'''
+
+def decode(count, chunks):
+    env = dict(os.environ, IMG_WATCH_LIB="1")
+    process = subprocess.Popen(
+        [bash, "-c", script, "_", watch, str(count)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    for delay, chunk in chunks:
+        if delay:
+            time.sleep(delay)
+        process.stdin.write(chunk)
+        process.stdin.flush()
+    process.stdin.close()
+    stdout = process.stdout.read().decode().splitlines()
+    stderr = process.stderr.read().decode()
+    if process.wait() != 0:
+        raise SystemExit(stderr)
+    return stdout
+
+arrows = decode(5, [(0, b"\x1b[A\x1b[B\x1b[C\x1b[Dq")])
+fragmented = decode(2, [(0, b"\x1b"), (0.01, b"["), (0.01, b"Aq")])
+plain = decode(4, [(0, b"\x1bx+\n")])
+
+env = dict(os.environ, IMG_WATCH_LIB="1")
+process = subprocess.Popen(
+    [bash, "-c", script, "_", watch, "1"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=env,
+)
+started = time.monotonic()
+process.stdin.write(b"\x1b")
+process.stdin.flush()
+ready = select.select([process.stdout], [], [], 0.25)[0]
+elapsed = time.monotonic() - started
+lone = process.stdout.readline().decode().strip() if ready else "TIMEOUT"
+process.stdin.close()
+process.wait()
+
+print("arrows " + " ".join(arrows))
+print("fragmented " + " ".join(fragmented))
+print("plain " + " ".join(plain))
+print("lone %s %s" % (lone, "fast" if elapsed < 0.25 else "slow"))
+PY
+); decoder_rc=$?
+check "the key decoder handles adjacent and fragmented terminal arrow sequences" \
+  '[[ $decoder_rc -eq 0 && "$decoder_report" == *$'"'"'arrows UP DOWN RIGHT LEFT q\nfragmented UP q'"'"'* ]]'
+check "the key decoder preserves non-arrow and Enter input around Escape" \
+  '[[ "$decoder_report" == *$'"'"'plain ESC x + ENTER'"'"'* ]]'
+check "a lone Escape returns within the decoder short timeout" \
+  '[[ "$decoder_report" == *$'"'"'lone ESC fast'"'"'* ]]'
 open_nav=$(IMG_WATCH_LIB=1 bash -c '
   source "$1"; cursor=0; last_seen=x; GRID_FOCUS=2; GRID_COUNT=3
   handle_key ENTER deck.grid.json; printf "%s %s " "$GRID_FOCUS" "$GRID_OPEN"

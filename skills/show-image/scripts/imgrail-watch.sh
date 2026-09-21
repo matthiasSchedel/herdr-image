@@ -6,8 +6,8 @@
 # Kitty graphics handshake and the terminal size are only knowable from inside
 # the pane, and an agent's shell has neither.
 #
-# Keys: +/- zoom, 0 fits, n/p page, r redraws, q quits. Grids also use
-# h/j/k/l to move focus, Enter to open a cell, and g to return to the grid.
+# Keys: +/- zoom, 0 fits, n/p page, r redraws, q quits. Grids also use the
+# arrow keys or h/j/k/l to move focus, Enter to open a cell, and g to return.
 set -uo pipefail
 
 E_USAGE=1; E_NORENDER=4; E_NOGRAPHICS=5
@@ -118,12 +118,11 @@ image_px() {
 # Natural size in cells, scaled by the zoom percent, then clamped to the pane
 # with the aspect ratio kept — clamping width and height independently is how a
 # tall image ends up stretched.
-target_cells() {
-  local px_w="$1" px_h="$2" cols="$3" rows="$4"
+target_cells_for_area() {
+  local px_w="$1" px_h="$2" max_c="$3" max_r="$4"
   local nat_c nat_r want_c want_r
   nat_c=$(( (px_w + cell_w - 1) / cell_w )); (( nat_c > 0 )) || nat_c=1
   nat_r=$(( (px_h + cell_h - 1) / cell_h )); (( nat_r > 0 )) || nat_r=1
-  local max_c=$(( cols - 1 )) max_r=$(( rows - 3 ))
   (( max_c > 0 )) || max_c=1
   (( max_r > 0 )) || max_r=1
   if [[ "$ZOOM" == fit ]]; then
@@ -149,6 +148,11 @@ target_cells() {
     fi
   fi
   printf '%s %s' "$want_c" "$want_r"
+}
+
+target_cells() {
+  local cols="$3" rows="$4"
+  target_cells_for_area "$1" "$2" "$(( cols - 1 ))" "$(( rows - 3 ))"
 }
 
 images() {
@@ -189,6 +193,93 @@ GRID_NAV_RIGHT=0
 GRID_NAV_UP=0
 GRID_NAV_DOWN=0
 GRID_OPEN=0
+KEY_PENDING=()
+READ_KEY=""
+ESCAPE_TIMEOUT=0.05
+
+# Decode one terminal key without losing bytes that do not form a supported
+# escape sequence. The short follow-up reads admit fragmented arrow sequences
+# while keeping a lone Escape independent of the rail's poll interval.
+read_terminal_char() {
+  local timeout="$1" value=""
+  if IFS= read -r -s -n1 -t "$timeout" value; then
+    if [[ -n "$value" ]]; then READ_KEY="$value"; else READ_KEY=ENTER; fi
+    return 0
+  fi
+  return 1
+}
+
+# Bash 3.2 accepts only whole seconds for `read -t`. Python already backs grid
+# composition, and select gives its tty or pipe one short, portable byte wait.
+read_escape_char() {
+  local python encoded
+  python=$(type -P python3 2>/dev/null) || return 1
+  encoded=$("$python" -c '
+import os
+import select
+import sys
+import termios
+import tty
+
+fd = 0
+saved = None
+try:
+    if os.isatty(fd):
+        saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd, termios.TCSANOW)
+    ready, _, _ = select.select([fd], [], [], float(sys.argv[1]))
+    if ready:
+        value = os.read(fd, 1)
+        if value:
+            sys.stdout.write(value.hex())
+finally:
+    if saved is not None:
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+' "$ESCAPE_TIMEOUT" 2>/dev/null) || return 1
+  [[ "$encoded" =~ ^[[:xdigit:]]{2}$ ]] || return 1
+  if [[ "$encoded" == 0a || "$encoded" == 0d ]]; then
+    READ_KEY=ENTER
+  else
+    printf -v READ_KEY "\\x$encoded"
+  fi
+}
+
+pending_key() {
+  KEY_PENDING[${#KEY_PENDING[@]}]="$1"
+}
+
+read_terminal_key() {
+  local timeout="$1" prefix="" final=""
+  READ_KEY=""
+  if (( ${#KEY_PENDING[@]} )); then
+    READ_KEY="${KEY_PENDING[0]}"
+    KEY_PENDING=("${KEY_PENDING[@]:1}")
+    return 0
+  fi
+  read_terminal_char "$timeout" || return 1
+  [[ "$READ_KEY" == $'\033' ]] || return 0
+  read_escape_char || { READ_KEY=ESC; return 0; }
+  prefix="$READ_KEY"
+  if [[ "$prefix" != "[" && "$prefix" != "O" ]]; then
+    pending_key "$prefix"
+    READ_KEY=ESC
+    return 0
+  fi
+  if ! read_escape_char; then
+    pending_key "$prefix"
+    READ_KEY=ESC
+    return 0
+  fi
+  final="$READ_KEY"
+  case "$final" in
+    A) READ_KEY=UP ;;
+    B) READ_KEY=DOWN ;;
+    C) READ_KEY=RIGHT ;;
+    D) READ_KEY=LEFT ;;
+    *) pending_key "$prefix"; pending_key "$final"; READ_KEY=ESC ;;
+  esac
+}
+
 composer_with_deadline() {
   python3 - "$GRID_TIMEOUT" "$@" <<'PY'
 import subprocess, sys
@@ -254,6 +345,9 @@ render_signature() {
 
 draw() {
   local file="$1" idx="$2" total="$3" cols="$4" rows="$5" dims px_w px_h size c r display_file zoom_label keys
+  local max_c=$(( cols - 1 )) max_r=$(( rows - 3 )) image_y=2 title=""
+  (( max_c > 0 )) || max_c=1
+  (( max_r > 0 )) || max_r=1
   printf '\033[2J\033[H'
   if [[ -z "$file" ]]; then
     printf 'imgrail — no images yet in %s\n' "$(printf '%s' "$DIR" | sanitize_text)"
@@ -261,11 +355,15 @@ draw() {
   fi
   display_file="$file"; GRID_TOTAL=1
   if [[ "$file" == *.grid.json ]]; then
-    compose_grid_page "$file" "$(( (cols - 1) * cell_w ))" "$(( (rows - 3) * cell_h ))" \
+    if (( GRID_OPEN )); then
+      max_r="$rows"; (( max_r > 0 )) || max_r=1
+      image_y=0
+    fi
+    compose_grid_page "$file" "$(( max_c * cell_w ))" "$(( max_r * cell_h ))" \
       || { printf '\033[31mgrid compose failed\033[0m — %s\n' "$(tail -n1 "$DIR/.render.log" 2>/dev/null | sanitize_text)"; return 0; }
     display_file="$GRID_FILE"
     zoom_label="page $((GRID_PAGE + 1))/$GRID_TOTAL, cell $((GRID_FOCUS + 1))/$GRID_COUNT"
-    keys="h/j/k/l move, Enter open, g grid, n/p page, +/- zoom, 0 fit, r redraw, q quit"
+    keys="arrows/h/j/k/l move, Enter open, g grid, n/p page, +/- zoom, 0 fit, r redraw, q quit"
     if (( GRID_OPEN )); then
       zoom_label="cell $((GRID_FOCUS + 1))/$GRID_COUNT open"
     fi
@@ -281,15 +379,21 @@ draw() {
     CURRENT_ZOOM=fit
   fi
   ZOOM="$CURRENT_ZOOM"
-  printf '\033[1m[%s/%s]\033[0m %s \033[2m(%s; %s)\033[0m\n' \
-    "$idx" "$total" "$(caption_of "$file" | sanitize_text)" "$zoom_label" "$keys"
+  if [[ "$file" == *.grid.json ]] && (( GRID_OPEN )); then
+    title=$(printf '[%s/%s] %s (%s; %s)' \
+      "$idx" "$total" "$(caption_of "$file" | sanitize_text)" "$zoom_label" "$keys" | sanitize_text)
+    printf '\033]2;%s\a' "$title"
+  else
+    printf '\033[1m[%s/%s]\033[0m %s \033[2m(%s; %s)\033[0m\n' \
+      "$idx" "$total" "$(caption_of "$file" | sanitize_text)" "$zoom_label" "$keys"
+  fi
   dims=$(image_px "$display_file" || printf '')
   if [[ -n "$dims" ]]; then
     px_w="${dims%%x*}"; px_h="${dims##*x}"
-    size=$(target_cells "$px_w" "$px_h" "$cols" "$rows")
+    size=$(target_cells_for_area "$px_w" "$px_h" "$max_c" "$max_r")
     c="${size%% *}"; r="${size##* }"
   else
-    c=$(( cols - 1 )); r=$(( rows - 3 ))
+    c="$max_c"; r="$max_r"
   fi
   # Renderer stderr goes to a log rather than /dev/null: "render failed" with no
   # reason is the one failure mode nobody can debug from inside a pane.
@@ -300,7 +404,7 @@ draw() {
   else
     kitten icat --transfer-mode=stream --align=left --scale-up \
       --use-window-size "$cols,$rows,$(( cols * cell_w )),$(( rows * cell_h ))" \
-      --place "${c}x${r}@0x2" "$display_file" 2>>"$log" \
+      --place "${c}x${r}@0x${image_y}" "$display_file" 2>>"$log" \
       || printf '\033[31mrender failed\033[0m — %s\n' "$(tail -n1 "$log" 2>/dev/null | sanitize_text)"
   fi
 }
@@ -341,10 +445,10 @@ handle_key() {
     +) adjust_zoom 25 ;;
     -) adjust_zoom -25 ;;
     0) INTERACTIVE_ZOOM=fit; last_seen="" ;;
-    h) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_LEFT"; GRID_OPEN=0; last_seen=""; } ;;
-    l) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_RIGHT"; GRID_OPEN=0; last_seen=""; } ;;
-    k) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_UP"; GRID_OPEN=0; last_seen=""; } ;;
-    j) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_DOWN"; GRID_OPEN=0; last_seen=""; } ;;
+    h|LEFT) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_LEFT"; GRID_OPEN=0; last_seen=""; } ;;
+    l|RIGHT) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_RIGHT"; GRID_OPEN=0; last_seen=""; } ;;
+    k|UP) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_UP"; GRID_OPEN=0; last_seen=""; } ;;
+    j|DOWN) [[ "$current_file" == *.grid.json ]] && { GRID_FOCUS="$GRID_NAV_DOWN"; GRID_OPEN=0; last_seen=""; } ;;
     ENTER)
       if [[ "$current_file" == *.grid.json && $GRID_COUNT -gt 0 ]]; then
         GRID_OPEN=1; last_seen=""
@@ -402,8 +506,6 @@ while :; do
   # One bounded read is both the key handler and the poll interval: no spin,
   # and no separate sleep that would swallow keystrokes.
   key=""
-  if IFS= read -r -s -n1 -t "$POLL" key; then
-    [[ -n "$key" ]] || key=ENTER
-  fi
+  if read_terminal_key "$POLL"; then key="$READ_KEY"; fi
   handle_key "$key" "$current" || [[ $? -ne 10 ]] || exit 0
 done
